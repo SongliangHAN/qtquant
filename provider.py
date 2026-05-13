@@ -17,7 +17,7 @@ app = FastAPI()
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 # 也可以直接写死
-DEEPSEEK_API_KEY = "sk-2a37e06687ef4441ba90672c5fe9a62a"
+DEEPSEEK_API_KEY = ""
 
 DEEPSEEK_BASE = "https://api.deepseek.com/anthropic"
 
