@@ -4,6 +4,8 @@ from typing import Callable
 
 import pandas as pd
 import numpy as np
+from scipy.cluster import hierarchy as sch
+from scipy.spatial.distance import squareform
 from factor_expression import ExpressionEngine
 
 
@@ -53,6 +55,106 @@ class BacktestEngine:
     def _has_code_safe(day: pd.DataFrame, code: str) -> bool:
         """检查 code 是否在 day 中，容忍重复索引"""
         return code in day.index
+
+    # =====================================
+    # HRP 分层风险平价权重
+    # =====================================
+
+    def _hrp_weights(self, returns_df: pd.DataFrame) -> dict:
+        """
+        Hierarchical Risk Parity 权重分配。
+
+        returns_df: T x N DataFrame，列为 code，值为日收益率
+        返回: {code: weight}，权重和为 1
+        """
+        codes = list(returns_df.columns)
+        n = len(codes)
+        if n <= 1:
+            return {c: 1.0 / n for c in codes} if n > 0 else {}
+        if n == 2:
+            # 两个标的时直接按逆波动率分配
+            vols = returns_df.std()
+            inv_vol = 1.0 / vols.replace(0, 0.2)
+            w = inv_vol / inv_vol.sum()
+            return {c: float(w[c]) for c in codes}
+
+        corr = returns_df.corr().values
+        # 距离矩阵
+        dist = np.sqrt(0.5 * (1.0 - corr))
+        # 确保对称且对角线为0
+        dist = (dist + dist.T) / 2.0
+        np.fill_diagonal(dist, 0.0)
+
+        try:
+            link = sch.linkage(squareform(dist), method="ward")
+        except Exception:
+            # 回退到逆波动率
+            vols = returns_df.std().clip(lower=0.01)
+            inv_vol = 1.0 / vols
+            w = inv_vol / inv_vol.sum()
+            return {c: float(w[c]) for c in codes}
+
+        # 递归二分分配
+        n_items = len(codes)
+        cluster_items = [[i] for i in range(n_items)]
+
+        def _get_cluster_var(indices):
+            if len(indices) == 1:
+                return np.var(returns_df.iloc[:, indices[0]])
+            sub_cov = returns_df.iloc[:, indices].cov().values
+            w_eq = np.ones(len(indices)) / len(indices)
+            return float(w_eq @ sub_cov @ w_eq)
+
+        def _bisect(cluster_idx):
+            items = cluster_items[cluster_idx]
+            if len(items) <= 1:
+                return {items[0]: 1.0}
+            # 在 linkage 中找到该簇的二分
+            left, right = None, None
+            for l_idx in range(len(link)):
+                merged = int(link[l_idx, 0]), int(link[l_idx, 1])
+                merged_set = set()
+                for m in merged:
+                    if m < n_items:
+                        merged_set.update(cluster_items[m])
+                    else:
+                        merged_set.update(cluster_items[m])
+                if merged_set == set(items):
+                    left_raw = int(link[l_idx, 0])
+                    right_raw = int(link[l_idx, 1])
+                    left = cluster_items[left_raw] if left_raw < n_items else cluster_items[left_raw]
+                    right = cluster_items[right_raw] if right_raw < n_items else cluster_items[right_raw]
+                    break
+            if left is None or right is None:
+                # 均分
+                return {i: 1.0 / len(items) for i in items}
+
+            var_left = _get_cluster_var(left)
+            var_right = _get_cluster_var(right)
+            alloc_left = (1.0 / var_left) if var_left > 0 else 1.0
+            alloc_right = (1.0 / var_right) if var_right > 0 else 1.0
+            total_alloc = alloc_left + alloc_right
+            w_left = alloc_left / total_alloc
+            w_right = alloc_right / total_alloc
+
+            result = {}
+            left_weights = _bisect(left_raw) if left_raw >= n_items else {left[0]: 1.0}
+            right_weights = _bisect(right_raw) if right_raw >= n_items else {right[0]: 1.0}
+            for i, w in left_weights.items():
+                result[i] = w * w_left
+            for i, w in right_weights.items():
+                result[i] = w * w_right
+
+            # 重归一化
+            total = sum(result.values())
+            if total > 0:
+                result = {k: v / total for k, v in result.items()}
+            return result
+
+        # 根簇索引为 len(link) + n_items - 1 (linkage 返回的最后一个合并)
+        root_cluster_items = list(range(n_items))
+        weights = _bisect(len(link) + n_items - 1)
+        return {codes[i]: weights.get(i, 0.0) for i in range(n_items)}
 
     # =====================================
     # 计算策略在某个 decision_date 的选股结果
@@ -237,9 +339,13 @@ class BacktestEngine:
         # 交易成本
         commission = commission_bps / 10000.0
         base_slippage = slippage_bps / 10000.0
+        impact_k = float(pos_rule.get("impact_k", 0.001))
 
-        def _dynamic_slippage(code, day_df):
-            """动态滑点：基础 + 波动率加成。day_df 是当日全量数据"""
+        def _dynamic_slippage(code, day_df, notional=0.0):
+            """
+            动态滑点：基础 + 波动率加成 + sqrt 冲击模型。
+            impact = impact_k * sqrt(notional / daily_amount)
+            """
             slip = base_slippage
             try:
                 row = day_df[day_df["code"] == code]
@@ -247,9 +353,13 @@ class BacktestEngine:
                     vol20 = self._safe_scalar(row["volatility20"].iloc[0]) if "volatility20" in row.columns else np.nan
                     if pd.notna(vol20):
                         slip += 0.5 * abs(vol20)
-                    amt_ma20 = self._safe_scalar(row["amount_ma20"].iloc[0]) if "amount_ma20" in row.columns else np.nan
-                    if pd.notna(amt_ma20) and amt_ma20 > 0:
-                        slip += 0.0001 / max(amt_ma20 / 1e8, 0.01)
+                    # sqrt 冲击模型
+                    if notional > 0:
+                        daily_amount = self._safe_scalar(row["amount"].iloc[0]) if "amount" in row.columns else np.nan
+                        if pd.notna(daily_amount) and daily_amount > 0:
+                            participation = notional / daily_amount
+                            impact = impact_k * np.sqrt(participation)
+                            slip += impact
             except (KeyError, ValueError, TypeError, IndexError):
                 pass
             return max(slip, base_slippage * 0.5)
@@ -390,7 +500,8 @@ class BacktestEngine:
                     positions[code] = p
                     continue
                 raw_price = float(open_price)
-                dyn_slip = _dynamic_slippage(code, day)
+                est_notional = raw_price * p.shares
+                dyn_slip = _dynamic_slippage(code, day, est_notional)
                 sell_price = raw_price * (1 - dyn_slip)
                 notional = sell_price * p.shares
                 fee = notional * commission
@@ -436,7 +547,8 @@ class BacktestEngine:
                         halted_codes.add(code)
                         continue
                     raw_price = float(open_price)
-                    dyn_slip = _dynamic_slippage(code, day)
+                    est_notional = effective_cash * raw_wt.get(code, 0)
+                    dyn_slip = _dynamic_slippage(code, day, est_notional)
                     buy_price = raw_price * (1 + dyn_slip)
 
                     # 流动性冻结：OHLC全相同且成交量极低 → 不可交易
@@ -549,25 +661,49 @@ class BacktestEngine:
                                 tradable = tradable_filtered
 
                     # ══════════════════════════════════════════
-                    # 仓位权重计算：逆波动率加权（等权 → 逆波动率 → Risk Parity）
+                    # 仓位权重计算：逆波动率加权 / HRP
                     # ══════════════════════════════════════════
-                    vol_target = pos_rule.get("volatility_target")
+                    allocation = pos_rule.get("allocation", "inv_vol")
                     max_single_wt = pos_rule.get("max_single_weight")
+                    hrp_lookback = int(pos_rule.get("hrp_lookback", 60))
 
                     raw_wt: dict[str, float] = {}
-                    if vol_target is not None and "volatility20" in day.columns:
-                        inv_vol = {}
-                        for code in tradable:
-                            try:
-                                vol = self._safe_scalar(day_vol.get(code, np.nan))
-                            except (KeyError, ValueError, TypeError):
-                                vol = np.nan
-                            if pd.notna(vol) and vol > 0.01:
-                                inv_vol[code] = 1.0 / vol
-                            else:
-                                inv_vol[code] = 1.0 / 0.20  # 默认年化20%波动
-                        total_inv = sum(inv_vol.values())
-                        raw_wt = {c: v / total_inv for c, v in inv_vol.items()} if total_inv > 0 else {}
+                    if allocation == "hrp" and len(tradable) >= 2:
+                        try:
+                            # 构建历史收益率矩阵（过去 hrp_lookback 天）
+                            all_dates = sorted(data["date"].unique())
+                            current_idx = all_dates.index(t) if t in all_dates else len(all_dates) - 1
+                            start_idx = max(0, current_idx - hrp_lookback)
+                            lookback_dates = all_dates[start_idx:current_idx + 1]
+                            hist = data[data["date"].isin(lookback_dates)]
+                            ret_pivot = hist.pivot_table(
+                                index="date", columns="code", values="ret", aggfunc="first"
+                            ).dropna(axis=1, how="all")
+                            avail_codes = [c for c in tradable if c in ret_pivot.columns]
+                            if len(avail_codes) >= 2:
+                                hrp_wt = self._hrp_weights(ret_pivot[avail_codes])
+                                raw_wt = {c: hrp_wt.get(c, 0.0) for c in tradable}
+                                total_w = sum(raw_wt.values())
+                                if total_w > 0:
+                                    raw_wt = {c: w / total_w for c, w in raw_wt.items()}
+                        except Exception:
+                            allocation = "inv_vol"  # 回退
+
+                    if not raw_wt:
+                        vol_target = pos_rule.get("volatility_target")
+                        if vol_target is not None and "volatility20" in day.columns:
+                            inv_vol = {}
+                            for code in tradable:
+                                try:
+                                    vol = self._safe_scalar(day_vol.get(code, np.nan))
+                                except (KeyError, ValueError, TypeError):
+                                    vol = np.nan
+                                if pd.notna(vol) and vol > 0.01:
+                                    inv_vol[code] = 1.0 / vol
+                                else:
+                                    inv_vol[code] = 1.0 / 0.20
+                            total_inv = sum(inv_vol.values())
+                            raw_wt = {c: v / total_inv for c, v in inv_vol.items()} if total_inv > 0 else {}
                     if not raw_wt:
                         # 等权兜底
                         raw_wt = {c: 1.0 / len(tradable) for c in tradable}

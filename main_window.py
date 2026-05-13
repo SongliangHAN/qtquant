@@ -7,6 +7,8 @@ import os
 import re
 import shutil
 import pandas as pd
+import numpy as np
+import pyqtgraph as pg
 from datetime import datetime, timedelta
 
 from data_service import DataService
@@ -22,6 +24,7 @@ from utils import now_str
 from strategy_optimizer import staged_optimization
 from optimizer_worker import OptimizerWorker
 from market_regime import MarketRegimeDetector
+from factor_lab import FactorLab
 
 
 # ==========================================
@@ -487,8 +490,271 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(
             self.build_backtest_page(),
             "策略回测"
-)
+        )
 
+        # 因子研究
+        self.tabs.addTab(
+            self.build_factor_lab_page(),
+            "因子研究"
+        )
+
+
+    # ==========================================
+    # 因子研究页面
+    # ==========================================
+
+    def build_factor_lab_page(self):
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        title = QLabel("因子研究 — 滚动RankIC · IC衰减 · 分位数收益 · 相关性 · 状态IC")
+        title.setStyleSheet("font-size:20px;font-weight:bold;")
+        layout.addWidget(title)
+
+        # ── 控制栏 ──
+        ctrl = QHBoxLayout()
+
+        ctrl.addWidget(QLabel("因子："))
+        self.fl_factor_checks = {}
+        from factor_monitor import GROUP_REPRESENTATIVES
+        for group, rep in GROUP_REPRESENTATIVES.items():
+            cb = QCheckBox(f"{group}({rep})")
+            cb.setChecked(True)
+            self.fl_factor_checks[rep] = cb
+            ctrl.addWidget(cb)
+
+        ctrl.addSpacing(16)
+        ctrl.addWidget(QLabel("IC前瞻期："))
+        self.fl_horizon = QSpinBox()
+        self.fl_horizon.setRange(1, 60)
+        self.fl_horizon.setValue(5)
+        ctrl.addWidget(self.fl_horizon)
+
+        ctrl.addWidget(QLabel("滚动窗口："))
+        self.fl_window = QSpinBox()
+        self.fl_window.setRange(20, 252)
+        self.fl_window.setValue(60)
+        ctrl.addWidget(self.fl_window)
+
+        ctrl.addWidget(QLabel("分位数："))
+        self.fl_n_quantiles = QSpinBox()
+        self.fl_n_quantiles.setRange(3, 10)
+        self.fl_n_quantiles.setValue(5)
+        ctrl.addWidget(self.fl_n_quantiles)
+
+        self.fl_compute_btn = QPushButton("开始计算")
+        self.fl_compute_btn.clicked.connect(self._on_fl_compute)
+        ctrl.addWidget(self.fl_compute_btn)
+
+        ctrl.addStretch()
+        layout.addLayout(ctrl)
+
+        # ── 图表子选项卡 ──
+        self.fl_chart_tabs = QTabWidget()
+        layout.addWidget(self.fl_chart_tabs, stretch=1)
+
+        # Rolling IC
+        self.fl_ic_plot = pg.PlotWidget(title="Rolling RankIC")
+        self.fl_ic_plot.setLabel("left", "|IC|")
+        self.fl_ic_plot.setLabel("bottom", "日期")
+        self.fl_ic_plot.addLegend()
+        self.fl_ic_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.fl_chart_tabs.addTab(self.fl_ic_plot, "Rolling IC")
+
+        # IC Decay
+        self.fl_decay_plot = pg.PlotWidget(title="IC Decay")
+        self.fl_decay_plot.setLabel("left", "Mean |IC|")
+        self.fl_decay_plot.setLabel("bottom", "Horizon (d)")
+        self.fl_decay_plot.addLegend()
+        self.fl_decay_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.fl_chart_tabs.addTab(self.fl_decay_plot, "IC Decay")
+
+        # Quantile Return
+        self.fl_quantile_plot = pg.PlotWidget(title="Quantile Forward Returns")
+        self.fl_quantile_plot.setLabel("left", "Mean Fwd Return")
+        self.fl_quantile_plot.setLabel("bottom", "日期")
+        self.fl_quantile_plot.addLegend()
+        self.fl_quantile_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.fl_chart_tabs.addTab(self.fl_quantile_plot, "分位数收益")
+
+        # Factor Correlation Heatmap
+        self.fl_corr_plot = pg.PlotWidget(title="因子截面相关性矩阵")
+        self.fl_corr_plot.setLabel("left", "")
+        self.fl_corr_plot.setLabel("bottom", "")
+        self.fl_chart_tabs.addTab(self.fl_corr_plot, "因子相关性")
+
+        # Regime IC
+        self.fl_regime_plot = pg.PlotWidget(title="Regime IC")
+        self.fl_regime_plot.setLabel("left", "Mean |IC|")
+        self.fl_regime_plot.setLabel("bottom", "Regime")
+        self.fl_regime_plot.addLegend()
+        self.fl_regime_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.fl_chart_tabs.addTab(self.fl_regime_plot, "Regime IC")
+
+        # ── 汇总表格 ──
+        self.fl_summary_table = QTableWidget()
+        self.fl_summary_table.setMinimumHeight(120)
+        layout.addWidget(self.fl_summary_table)
+
+        return page
+
+    def _on_fl_compute(self):
+        """执行因子研究计算并绘制结果。"""
+        selected = [f for f, cb in self.fl_factor_checks.items() if cb.isChecked()]
+        if not selected:
+            QMessageBox.warning(self, "提示", "请至少选择一个因子")
+            return
+
+        horizon = self.fl_horizon.value()
+        window = self.fl_window.value()
+        n_q = self.fl_n_quantiles.value()
+        self.fl_compute_btn.setEnabled(False)
+        self.fl_compute_btn.setText("计算中...")
+        QApplication.processEvents()
+
+        try:
+            # 加载数据
+            codes = [x["code"] for x in self.ds.get_all_etf()]
+            data = self.research.load_many(codes, start="2015-01-01")
+            if data.empty:
+                QMessageBox.warning(self, "提示", "没有可用的研究数据")
+                return
+
+            lab = FactorLab(data)
+
+            # ── Rolling IC ──
+            ic_df = lab.compute_rolling_ic(factors=selected, horizon=horizon, window=window)
+            self.fl_ic_plot.clear()
+            self.fl_ic_plot.addLegend()
+            if not ic_df.empty:
+                colors = ["#40c4ff", "#ffd54f", "#00e676", "#ff4081", "#ffab40"]
+                for idx, col in enumerate([c for c in ic_df.columns if c != "date"]):
+                    y = ic_df[col].values
+                    x = ic_df["date"].values.astype("datetime64[s]").astype(int)
+                    pen = pg.mkPen(color=colors[idx % len(colors)], width=1.5)
+                    self.fl_ic_plot.plot(x, y, pen=pen, name=col.replace("ic_", ""))
+
+            # ── IC Decay ──
+            decay_df = lab.compute_ic_decay(factors=selected, horizons=[1, 5, 10, 20])
+            self.fl_decay_plot.clear()
+            self.fl_decay_plot.addLegend()
+            if not decay_df.empty:
+                colors = ["#40c4ff", "#ffd54f", "#00e676", "#ff4081", "#ffab40"]
+                for idx, row in decay_df.iterrows():
+                    factor = row["factor"]
+                    x = [1, 5, 10, 20]
+                    y = [row.get(f"h{h}", np.nan) for h in x]
+                    pen = pg.mkPen(color=colors[idx % len(colors)], width=2)
+                    sym = pg.ScatterPlotItem(x=x, y=y, pen=pen, brush=colors[idx % len(colors)],
+                                              size=10, name=factor)
+                    self.fl_decay_plot.addItem(sym)
+                    self.fl_decay_plot.plot(x, y, pen=pen)
+
+            # ── Quantile Return ──
+            if selected:
+                q_df = lab.compute_quantile_returns(factor=selected[0], horizon=horizon, n_quantiles=n_q)
+                self.fl_quantile_plot.clear()
+                self.fl_quantile_plot.addLegend()
+                if not q_df.empty:
+                    cmap = ["#2d8cf0", "#40c4ff", "#69f0ae", "#ffd54f", "#ff4081"]
+                    for idx, col in enumerate(sorted(q_df.columns)):
+                        if col.startswith("q"):
+                            y = q_df[col].values
+                            x = q_df.index.values.astype("datetime64[s]").astype(int)
+                            pen = pg.mkPen(color=cmap[idx % len(cmap)], width=1.5)
+                            self.fl_quantile_plot.plot(x, y, pen=pen, name=f"{selected[0]} {col}")
+
+            # ── Factor Correlation ──
+            corr_df = lab.compute_factor_correlation(factors=selected)
+            self.fl_corr_plot.clear()
+            if not corr_df.empty:
+                n = len(corr_df)
+                img = pg.ImageItem()
+                img.setImage(corr_df.values)
+                # Center the image at row/column indices
+                img.setRect(-0.5, -0.5, n, n)
+                # Custom color map: blue to white to red
+                from pyqtgraph import ColorMap
+                cmap = pg.colormap.get("coolwarm")
+                if cmap is None:
+                    lut_vals = []
+                    for i in range(256):
+                        r = int(255 * (i / 255.0))
+                        g = int(255 * (1.0 - abs(i - 127.5) / 127.5))
+                        b = int(255 * (1.0 - i / 255.0))
+                        lut_vals.append([r, g, b])
+                    cmap = ColorMap(np.array(lut_vals, dtype=np.ubyte))
+                img.setLookupTable(cmap.getLookupTable())
+                self.fl_corr_plot.addItem(img)
+
+                # Labels
+                tick_positions = [(i, name) for i, name in enumerate(corr_df.index)]
+                ax = self.fl_corr_plot.getAxis("bottom")
+                ax.setTicks([tick_positions])
+                ay = self.fl_corr_plot.getAxis("left")
+                ay.setTicks([tick_positions])
+
+            # ── Regime IC ──
+            regime_df = lab.compute_regime_ic(factors=selected, horizon=horizon)
+            self.fl_regime_plot.clear()
+            self.fl_regime_plot.addLegend()
+            if not regime_df.empty:
+                regimes_list = regime_df.columns.drop("factor", errors="ignore").tolist()
+                bar_width = 0.15
+                colors = ["#40c4ff", "#ffd54f", "#00e676", "#ff4081", "#ffab40"]
+                for r_idx, regime_name in enumerate(regimes_list):
+                    for f_idx, row in regime_df.iterrows():
+                        factor_name = row["factor"]
+                        val = row.get(regime_name, np.nan)
+                        if not np.isnan(val):
+                            x_pos = f_idx + r_idx * bar_width
+                            bar = pg.BarGraphItem(
+                                x=[x_pos], height=[val], width=bar_width,
+                                brush=colors[r_idx % len(colors)], name=regime_name
+                            )
+                            self.fl_regime_plot.addItem(bar)
+
+                # X-axis ticks at factor positions
+                x_ticks = [(i + bar_width * (len(regimes_list) - 1) / 2,
+                            regime_df["factor"].iloc[i]) for i in range(len(regime_df))]
+                self.fl_regime_plot.getAxis("bottom").setTicks([x_ticks])
+
+            # ── 汇总表格 ──
+            self.fl_summary_table.clear()
+            if not ic_df.empty:
+                ic_cols = [c for c in ic_df.columns if c != "date"]
+                # 最近的滚动IC值
+                last_row = ic_df.dropna().iloc[-1] if len(ic_df.dropna()) > 0 else None
+                if last_row is not None:
+                    rows = len(ic_cols)
+                    self.fl_summary_table.setRowCount(rows)
+                    self.fl_summary_table.setColumnCount(4)
+                    self.fl_summary_table.setHorizontalHeaderLabels(["因子", "最新RollingIC", "ICIR", "Mean IC (Decay h5)"])
+                    for i, col in enumerate(ic_cols):
+                        factor_name = col.replace("ic_", "")
+                        ic_val = last_row.get(col, np.nan)
+                        ic_series = ic_df[col].dropna()
+                        icir = ic_series.mean() / ic_series.std() if len(ic_series) > 1 and ic_series.std() > 0 else np.nan
+                        decay_h5 = np.nan
+                        if not decay_df.empty:
+                            dr = decay_df[decay_df["factor"] == factor_name]
+                            if len(dr) > 0:
+                                decay_h5 = dr["h5"].iloc[0]
+
+                        self.fl_summary_table.setItem(i, 0, QTableWidgetItem(factor_name))
+                        self.fl_summary_table.setItem(i, 1,
+                            QTableWidgetItem(f"{ic_val:.4f}" if not np.isnan(ic_val) else "N/A"))
+                        self.fl_summary_table.setItem(i, 2,
+                            QTableWidgetItem(f"{icir:.4f}" if not np.isnan(icir) else "N/A"))
+                        self.fl_summary_table.setItem(i, 3,
+                            QTableWidgetItem(f"{decay_h5:.4f}" if not np.isnan(decay_h5) else "N/A"))
+
+        except Exception as e:
+            QMessageBox.warning(self, "计算错误", str(e))
+        finally:
+            self.fl_compute_btn.setEnabled(True)
+            self.fl_compute_btn.setText("开始计算")
 
     # ==========================================
     # 数据下载页面
@@ -1148,8 +1414,13 @@ class MainWindow(QMainWindow):
 
         btn_row = QHBoxLayout()
         self.optimize_btn = QPushButton("开始参数搜索优化")
+        self.cancel_optimize_btn = QPushButton("停止优化")
+        self.cancel_optimize_btn.setStyleSheet("background:#f56c6c; color:#fff;")
+        self.cancel_optimize_btn.setEnabled(False)
+        self.cancel_optimize_btn.hide()
         self.open_strategy_dir_btn = QPushButton("打开策略文件夹")
         btn_row.addWidget(self.optimize_btn)
+        btn_row.addWidget(self.cancel_optimize_btn)
         btn_row.addWidget(self.open_strategy_dir_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
@@ -1184,6 +1455,30 @@ class MainWindow(QMainWindow):
         opt_layout.addWidget(self.opt_cutoff, 2, 3)
         layout.addWidget(opt_box)
 
+        # ── 状态栏 ──
+        self.strategy_status = QLabel("就绪")
+        self.strategy_status.setStyleSheet("""
+            QLabel {
+                background: #2a2a2a;
+                border: 1px solid #444;
+                padding: 8px 12px;
+                font-size: 13px;
+                color: #b0b0b0;
+                border-radius: 4px;
+            }
+        """)
+        self.strategy_status.setWordWrap(True)
+        self.strategy_status.setMinimumHeight(40)
+        layout.addWidget(self.strategy_status)
+
+        # ── 进度条 ──
+        self.strategy_progress = QProgressBar()
+        self.strategy_progress.setRange(0, 100)
+        self.strategy_progress.setValue(0)
+        self.strategy_progress.setTextVisible(True)
+        self.strategy_progress.setFormat("")
+        layout.addWidget(self.strategy_progress)
+
         self.strategy_build_log = QTextEdit()
         self.strategy_build_log.setReadOnly(True)
         layout.addWidget(self.strategy_build_log)
@@ -1191,6 +1486,7 @@ class MainWindow(QMainWindow):
         # 事件
         self.builder_combo.currentTextChanged.connect(self.on_builder_changed)
         self.optimize_btn.clicked.connect(self.on_optimize_strategy)
+        self.cancel_optimize_btn.clicked.connect(self.on_cancel_optimize)
         self.open_strategy_dir_btn.clicked.connect(self.open_strategy_dir)
         self.on_builder_changed(self.builder_combo.currentText())
 
@@ -1315,7 +1611,13 @@ class MainWindow(QMainWindow):
 
         # 防止卡UI：后台线程执行
         self.optimize_btn.setEnabled(False)
+        self.cancel_optimize_btn.setEnabled(True)
+        self.cancel_optimize_btn.show()
+        self.cancel_optimize_btn.setText("停止优化")
         self.strategy_build_log.clear()
+        self.strategy_status.setText("")
+        self.strategy_progress.setValue(0)
+        self.strategy_progress.setFormat("准备中...")
 
         factors = self.get_factor_candidates()
         cutoff = self.normalize_date_input(self.opt_cutoff.text()) or "2025-12-31"
@@ -1355,43 +1657,42 @@ class MainWindow(QMainWindow):
 
             def _group_mean(factors):
                 if len(factors) == 1:
-                    return f"rank({factors[0]})"
+                    return f"_r_{factors[0]}"
                 n = len(factors)
-                return "(" + " + ".join(f"rank({f})" for f in factors) + f") / {n}"
+                return "(" + " + ".join(f"_r_{f}" for f in factors) + f") / {n}"
 
             trend_score    = _group_mean(_trend_raw)
             risk_score     = _group_mean(_risk_raw)
             volume_score   = _group_mean(_vol_raw)
             structure_score = _group_mean(_struct_raw)
-            mean_rev_score = "rank(ma_distance)"
+            mean_rev_score = "_r_ma_distance"
 
             # ── 固定 Regime 权重（不可优化）──
-            # Bull:  0.50*trend + 0.20*volume + 0.15*structure - 0.15*risk
-            # Bear:  0.15*trend + 0.15*volume + 0.20*structure - 0.50*risk   (structure: beta→低偏离)
-            # Sideways: 0.20*trend + 0.15*volume + 0.15*structure - 0.35*risk + 0.15*mean_reversion
+            # ── 动态因子权重（由 FactorMonitor 预计算为 dw_* 列）──
+            # 方向由表达式中 +/- 确定，dw_* 值为非负（基于 |ICIR|）
+            # 若 dw_* 列缺失则回退到默认等权 0.2
 
             # Bear/panic 中 structure 改为 beta 偏离惩罚
-            struct_bear = "(" + " + ".join(f"rank({f})" for f in ["barra_beta", "corr_hs300_60"]) + ") / 2"
-            struct_bear_expr = f"( rank(-abs(barra_beta - 1.0)) + rank(corr_hs300_60) ) / 2"
+            struct_bear_expr = f"( _r_beta_penalty + _r_corr_hs300_60 ) / 2"
 
             bull_expr = (
-                f"0.50 * {trend_score} + "
-                f"0.20 * {volume_score} + "
-                f"0.15 * {structure_score} - "
-                f"0.15 * {risk_score}"
+                f"dw_trend * {trend_score} + "
+                f"dw_volume * {volume_score} + "
+                f"dw_structure * {structure_score} - "
+                f"dw_risk * {risk_score}"
             )
             bear_expr = (
-                f"0.15 * {trend_score} + "
-                f"0.15 * {volume_score} + "
-                f"0.20 * {struct_bear_expr} - "
-                f"0.50 * {risk_score}"
+                f"dw_trend * {trend_score} + "
+                f"dw_volume * {volume_score} + "
+                f"dw_structure * {struct_bear_expr} - "
+                f"dw_risk * {risk_score}"
             )
             sideways_expr = (
-                f"0.20 * {trend_score} + "
-                f"0.15 * {volume_score} + "
-                f"0.15 * {structure_score} - "
-                f"0.35 * {risk_score} + "
-                f"0.15 * {mean_rev_score}"
+                f"dw_trend * {trend_score} + "
+                f"dw_volume * {volume_score} + "
+                f"dw_structure * {structure_score} - "
+                f"dw_risk * {risk_score} + "
+                f"dw_meanrev * {mean_rev_score}"
             )
 
             regime_expr = (
@@ -1458,6 +1759,9 @@ class MainWindow(QMainWindow):
                 },
                 "position": {
                     "max_positions": top_n,
+                    "allocation": "hrp",          # "inv_vol" 或 "hrp"
+                    "hrp_lookback": 60,
+                    "impact_k": 0.001,             # sqrt 冲击模型系数
                     "volatility_target": 0.15,
                     "max_single_weight": 0.30,
                     "max_portfolio_dd": 0.15,
@@ -1477,7 +1781,43 @@ class MainWindow(QMainWindow):
             if data is None or data.empty:
                 return data
             # 加速：先过滤一遍（避免构造太多fold）
-            return data[data["date"] <= cutoff].copy()
+            data = data[data["date"] <= cutoff].copy()
+
+            # 预计算逐日截面排名，避免每次 trial 都重复 rank()
+            skip_cols = {"code", "date", "regime", "breadth", "amount",
+                         "close", "open", "high", "low", "volume", "amount_ma20"}
+            for col in data.columns:
+                if col in skip_cols or not col.isidentifier():
+                    continue
+                try:
+                    data[f"_r_{col}"] = data.groupby("date")[col].transform(
+                        lambda x: x.rank(pct=True))
+                except Exception:
+                    pass
+
+            # 预计算 Bear 模式的 beta 偏离惩罚 rank
+            try:
+                data["_r_beta_penalty"] = data.groupby("date")["barra_beta"].transform(
+                    lambda x: (-abs(x - 1.0)).rank(pct=True))
+            except Exception:
+                pass
+
+            # 预计算动态因子权重（Rolling RankIC → ICIR → 归一化权重）
+            try:
+                from factor_monitor import FactorMonitor
+                fm = FactorMonitor(data)
+                dw_df = fm.compute_weights(fwd_days=5, ic_window=60)
+                if not dw_df.empty:
+                    dw_cols = [c for c in dw_df.columns if c.startswith("dw_")]
+                    data = data.merge(dw_df[["date"] + dw_cols], on="date", how="left")
+                    # 前向填充缺失值（初始窗口期 IC 不足）
+                    for c in dw_cols:
+                        if c in data.columns:
+                            data[c] = data[c].fillna(data[c].mean() if data[c].notna().any() else 0.2)
+            except Exception:
+                pass
+
+            return data
 
         self.strategy_build_log.append(
             f"开始三阶段搜索：次数={n_trials} | TopK={top_k} | 截止={cutoff}"
@@ -1511,12 +1851,21 @@ class MainWindow(QMainWindow):
 
         def on_failed(msg: str):
             self.optimize_btn.setEnabled(True)
+            self.cancel_optimize_btn.setEnabled(False)
+            self.cancel_optimize_btn.hide()
             self.opt_worker = None
+            self.strategy_status.setText("优化失败")
+            self.strategy_progress.setFormat("失败")
             QMessageBox.warning(self, "优化失败", msg)
 
         def on_finished(payload: dict):
             self.optimize_btn.setEnabled(True)
+            self.cancel_optimize_btn.setEnabled(False)
+            self.cancel_optimize_btn.hide()
             self.opt_worker = None
+            self.strategy_status.setText("优化完成")
+            self.strategy_progress.setValue(100)
+            self.strategy_progress.setFormat("完成")
             stg = payload.get("strategy") or {}
             best_score = float(payload.get("best_score", 0.0))
             best_params = payload.get("best_params") or {}
@@ -1571,6 +1920,9 @@ class MainWindow(QMainWindow):
         worker.signals.progress.connect(on_progress, Qt.QueuedConnection)
         worker.signals.failed.connect(on_failed, Qt.QueuedConnection)
         worker.signals.finished.connect(on_finished, Qt.QueuedConnection)
+        worker.signals.phase.connect(self._on_opt_phase, Qt.QueuedConnection)
+        worker.signals.status.connect(self._on_opt_status, Qt.QueuedConnection)
+        worker.signals.cancelled.connect(self._on_opt_cancelled, Qt.QueuedConnection)
 
         self.pool.start(worker)
 
@@ -1578,6 +1930,74 @@ class MainWindow(QMainWindow):
         self.strategy_combo.clear()
         for n in self.stg.get_all_strategies():
             self.strategy_combo.addItem(n)
+
+    def on_cancel_optimize(self):
+        """用户点击停止优化"""
+        self.cancel_optimize_btn.setEnabled(False)
+        self.cancel_optimize_btn.setText("停止中...")
+        self.strategy_build_log.append("正在停止优化...")
+        if self.opt_worker:
+            self.opt_worker.cancel()
+
+    def _on_opt_phase(self, phase_name: str):
+        """阶段切换"""
+        self.strategy_build_log.append(f"[{phase_name}] 进行中...")
+
+    def _on_opt_status(self, d: dict):
+        """实时状态栏更新"""
+        phase = d.get("phase", "")
+        trial = d.get("trial", 0)
+        n_trials = d.get("n_trials", 0)
+        fold = d.get("fold", 0)
+        n_folds = d.get("n_folds", 0)
+        best = d.get("best", 0.0)
+        elapsed = d.get("elapsed_sec", 0.0)
+        eta = d.get("eta_sec", 0.0)
+
+        def _fmt(sec):
+            if sec < 60:
+                return f"{sec:.0f}s"
+            m, s = divmod(int(sec), 60)
+            if m < 60:
+                return f"{m}m{s:02d}s"
+            h, m = divmod(m, 60)
+            return f"{h}h{m:02d}m"
+
+        parts = [f"[{phase}]"]
+        if n_trials > 0:
+            parts.append(f"试验 {trial}/{n_trials}")
+        if n_folds > 0:
+            parts.append(f"折 {fold}/{n_folds}")
+        parts.append(f"最优 {best:.4f}")
+        parts.append(f"已用 {_fmt(elapsed)}")
+        if eta > 0:
+            parts.append(f"剩余 {_fmt(eta)}")
+
+        self.strategy_status.setText(" | ".join(parts))
+
+        if n_trials > 0 and phase == "Trial搜索":
+            pct = int(trial / n_trials * 100)
+            self.strategy_progress.setValue(pct)
+            self.strategy_progress.setFormat(f"{pct}% ({trial}/{n_trials})")
+
+    def _on_opt_cancelled(self, partial: dict):
+        """优化被取消，展示部分结果"""
+        self.optimize_btn.setEnabled(True)
+        self.cancel_optimize_btn.setEnabled(False)
+        self.cancel_optimize_btn.hide()
+        self.opt_worker = None
+        self.strategy_status.setText("已停止")
+        self.strategy_progress.setFormat("已停止")
+        self.strategy_build_log.append("优化已取消")
+
+        best_params = partial.get("best_params") or {}
+        best_score = partial.get("best_score", 0.0)
+        if best_params:
+            self.strategy_build_log.append(
+                f"部分结果: best_score={best_score:.4f}, best_params={best_params}"
+            )
+        else:
+            self.strategy_build_log.append("无可用部分结果")
 
     def normalize_date_input(self, s: str):
         s = (s or "").strip()
