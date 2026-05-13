@@ -1,4 +1,5 @@
 import random
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -222,6 +223,9 @@ def staged_optimization(
     commission_bps: float = 1.0,
     slippage_bps: float = 2.0,
     progress_cb: Optional[Callable[[int, int, float], None]] = None,
+    status_cb: Optional[Callable[[dict], None]] = None,
+    phase_cb: Optional[Callable[[str], None]] = None,
+    cancel_event=None,
 ) -> SearchResult:
     """
     三阶段优化器：硬过滤 → Pareto Frontier → 参数稳定性
@@ -248,6 +252,9 @@ def staged_optimization(
             detail=[{"error": "数据长度不足以构造WFO分段"}],
         )
 
+    if phase_cb:
+        phase_cb("WFO分段")
+
     rng = random.Random(seed)
     n_trials = int(n_trials)
 
@@ -257,8 +264,25 @@ def staged_optimization(
 
     best_mean = -1e9
 
+    if phase_cb:
+        phase_cb("Trial搜索")
+    trial_start = time.monotonic()
+
     # ── Per-trial WFO evaluation ──
     for i, params in enumerate(params_list):
+        # Cancel check
+        if cancel_event and cancel_event.is_set():
+            if survivors:
+                survivors.sort(key=lambda x: x["fold_mean"], reverse=True)
+                best = survivors[0]
+                return SearchResult(
+                    best_params=best["params"] or {},
+                    best_score=float(best["fold_mean"]),
+                    detail=all_detail,
+                )
+            return SearchResult(best_params={}, best_score=-1e9,
+                              detail=[{"error": "用户取消，无通过硬过滤的候选"}])
+
         stg = build_strategy(params)
         fold_metrics_list = []
         fold_pareto_list = []
@@ -316,13 +340,37 @@ def staged_optimization(
             "fold_mean": fold_mean, "fold_std": fold_std,
         })
 
-        if progress_cb and ((i + 1) % 5 == 0 or (i + 1) == n_trials):
+        if progress_cb:
             progress_cb(i + 1, n_trials, best_mean)
+        if status_cb:
+            elapsed = time.monotonic() - trial_start
+            completed = i + 1
+            eta = (elapsed / completed) * (n_trials - completed) if completed > 0 else 0.0
+            status_cb({
+                "phase": "Trial搜索",
+                "trial": completed,
+                "n_trials": n_trials,
+                "fold": len(fold_metrics_list),
+                "n_folds": len(folds),
+                "best": float(best_mean),
+                "elapsed_sec": elapsed,
+                "eta_sec": eta,
+            })
 
     if not survivors:
         return SearchResult(best_params={}, best_score=-1e9, detail=[{"error": "所有候选未通过硬过滤"}])
 
     # ── Stage 2: Pareto Frontier ──
+    if cancel_event and cancel_event.is_set():
+        survivors.sort(key=lambda x: x["fold_mean"], reverse=True)
+        best = survivors[0]
+        return SearchResult(
+            best_params=best["params"] or {},
+            best_score=float(best["fold_mean"]),
+            detail=all_detail,
+        )
+    if phase_cb:
+        phase_cb("Pareto筛选")
     pareto_candidates = pareto_filter(survivors)
     if not pareto_candidates:
         # 兜底：取 top_k 个 fold_mean 最高的
@@ -330,7 +378,23 @@ def staged_optimization(
         pareto_candidates = survivors[:max(1, int(top_k))]
 
     # ── Stage 3: Parameter Stability ──
-    for cand in pareto_candidates:
+    if phase_cb:
+        phase_cb("Stability测试")
+    n_pareto = len(pareto_candidates)
+    for cand_idx, cand in enumerate(pareto_candidates):
+        if cancel_event and cancel_event.is_set():
+            break
+        if status_cb:
+            status_cb({
+                "phase": "Stability测试",
+                "trial": cand_idx + 1,
+                "n_trials": n_pareto,
+                "fold": 0,
+                "n_folds": 0,
+                "best": float(best_mean),
+                "elapsed_sec": time.monotonic() - trial_start,
+                "eta_sec": 0.0,
+            })
         try:
             stab = stability_score_fn(
                 bt_engine, build_strategy, df,

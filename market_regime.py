@@ -224,6 +224,33 @@ class MarketRegimeDetector:
         d["dispersion_smooth"] = d["dispersion"].rolling(5, min_periods=1).mean()
         return d[["date", "dispersion", "dispersion_smooth"]]
 
+    # ══════════════════════════════════════════
+    # Breadth Thrust — 广度加速度信号
+    # ══════════════════════════════════════════
+
+    def calc_breadth_thrust(self, breadth_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        计算广度推力信号。
+        breadth_thrust  = EMA5(breadth) - EMA20(breadth)
+        newhigh_thrust  = EMA5(breadth_newhigh) - EMA20(breadth_newhigh)
+
+        正推力 = 市场宽度正在加速改善（快于慢速 EMA）
+        负推力 = 市场宽度正在恶化
+        """
+        df = breadth_df.sort_values("date").copy()
+        df["breadth_ema5"] = df["breadth"].ewm(span=5, min_periods=3).mean()
+        df["breadth_ema20"] = df["breadth"].ewm(span=20, min_periods=10).mean()
+        df["breadth_thrust"] = df["breadth_ema5"] - df["breadth_ema20"]
+
+        if "breadth_newhigh" in df.columns:
+            df["newhigh_ema5"] = df["breadth_newhigh"].ewm(span=5, min_periods=3).mean()
+            df["newhigh_ema20"] = df["breadth_newhigh"].ewm(span=20, min_periods=10).mean()
+            df["newhigh_thrust"] = df["newhigh_ema5"] - df["newhigh_ema20"]
+        else:
+            df["newhigh_thrust"] = 0.0
+
+        return df[["date", "breadth_thrust", "newhigh_thrust"]]
+
     def calc_market_score(self, all_etf_df: pd.DataFrame, core_codes: list[str] | None = None) -> pd.DataFrame:
         """
         计算综合市场评分 market_score (0~1)。
@@ -259,6 +286,7 @@ class MarketRegimeDetector:
             / gap[mask]
         )
 
+        # 基础市场评分
         m["market_score"] = (
             0.35 * m["breadth_ma20"]
             + 0.35 * m["breadth_roc20"]
@@ -267,5 +295,30 @@ class MarketRegimeDetector:
             - 0.10 * m["dispersion_norm"]
         )
 
+        # Breadth Thrust 加速信号
+        thrust_df = self.calc_breadth_thrust(m)
+        m = m.merge(thrust_df, on="date", how="left")
+        m["breadth_thrust"] = m["breadth_thrust"].fillna(0.0)
+        m["newhigh_thrust"] = m["newhigh_thrust"].fillna(0.0)
+
+        # 推力加成：±0.12 的调整范围
+        def _thrust_bonus(bt, nt):
+            bonus = 0.0
+            if bt > 0.03:
+                bonus += 0.08
+            elif bt < -0.03:
+                bonus -= 0.08
+            if nt > 0.03:
+                bonus += 0.04
+            elif nt < -0.03:
+                bonus -= 0.04
+            return bonus
+
+        m["thrust_bonus"] = m.apply(
+            lambda r: _thrust_bonus(r["breadth_thrust"], r["newhigh_thrust"]), axis=1
+        )
+        m["market_score"] = (m["market_score"] + m["thrust_bonus"]).clip(0.0, 1.0)
+
         return m[["date", "market_score", "breadth_up", "breadth_ma20",
-                   "breadth_roc20", "breadth_newhigh", "breadth_dispersion"]]
+                   "breadth_roc20", "breadth_newhigh", "breadth_dispersion",
+                   "breadth_thrust", "newhigh_thrust"]]
