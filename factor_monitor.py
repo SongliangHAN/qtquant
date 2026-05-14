@@ -22,7 +22,7 @@ FACTOR_GROUPS = {
     "risk":     ["volatility20", "downside_volatility", "max_drawdown20"],
     "volume":   ["turnover_change", "vol_ratio20"],
     "structure": ["barra_beta", "corr_hs300_60"],
-    "mean_reversion": ["ma_distance"],
+    "meanrev": ["ma_distance"],
 }
 
 # Representative factor per group (used for IC computation)
@@ -31,7 +31,7 @@ GROUP_REPRESENTATIVES = {
     "risk":     "volatility20",
     "volume":   "vol_ratio20",
     "structure": "barra_beta",
-    "mean_reversion": "ma_distance",
+    "meanrev": "ma_distance",
 }
 
 # Column naming: prefix for dynamic weight columns

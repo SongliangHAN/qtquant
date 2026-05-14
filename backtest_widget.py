@@ -49,6 +49,7 @@ class BacktestWorker(QRunnable):
                 "benchmark": res.get("benchmark", pd.DataFrame()),
                 "trades": res.get("trades", pd.DataFrame()),
                 "metrics": res.get("metrics", {}),
+                "filter_chain": res.get("filter_chain", {}),
             })
         except Exception:
             import traceback
@@ -84,10 +85,7 @@ class BacktestChartWidget(QWidget):
         self.p1.setMenuEnabled(False)
         self.p1.addLegend()
 
-        # ── 表格区 ──
-        table_splitter = QSplitter(Qt.Horizontal)
-
-        # 持仓明细
+        # ── 持仓明细 ──
         self.holdings_table = QTableWidget()
         self.holdings_table.setColumnCount(4)
         self.holdings_table.setHorizontalHeaderLabels(["开始日期", "结束日期", "持仓标的", "期间收益率"])
@@ -95,19 +93,7 @@ class BacktestChartWidget(QWidget):
         self.holdings_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.holdings_table.setAlternatingRowColors(True)
         self.holdings_table.setStyleSheet("QTableWidget { font-size: 11px; }")
-        table_splitter.addWidget(self.holdings_table)
-
-        # 分阶段收益
-        self.return_table = QTableWidget()
-        self.return_table.setColumnCount(4)
-        self.return_table.setHorizontalHeaderLabels(["阶段", "开始-结束", "策略收益", "基准收益"])
-        self.return_table.horizontalHeader().setStretchLastSection(True)
-        self.return_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.return_table.setAlternatingRowColors(True)
-        self.return_table.setStyleSheet("QTableWidget { font-size: 11px; }")
-        table_splitter.addWidget(self.return_table)
-
-        layout.addWidget(table_splitter, stretch=2)
+        layout.addWidget(self.holdings_table, stretch=2)
 
     # ───── 绘制 ─────
     def draw(self, equity_df, benchmark_df=None, trades=None, metrics=None):
@@ -182,9 +168,6 @@ class BacktestChartWidget(QWidget):
         # ── 持仓表 ──
         self._build_holdings_table(equity_df, trades)
 
-        # ── 收益率表 ──
-        self._build_return_table(equity_df, benchmark_df)
-
     # ───── 持仓明细表 ─────
     def _build_holdings_table(self, equity_df, trades):
         self.holdings_table.setRowCount(0)
@@ -223,100 +206,3 @@ class BacktestChartWidget(QWidget):
             self.holdings_table.setItem(i, 3, item)
 
         self.holdings_table.resizeColumnsToContents()
-
-    # ───── 分阶段收益率表 ─────
-    def _build_return_table(self, equity_df, benchmark_df=None):
-        self.return_table.setRowCount(0)
-
-        if equity_df is None or equity_df.empty:
-            self.return_table.setRowCount(1)
-            self.return_table.setItem(0, 0, QTableWidgetItem("无数据"))
-            return
-
-        eq = equity_df.sort_values("date")
-        nav = eq["nav"].astype(float)
-
-        # 分阶段：月度、季度、年度
-        eq2 = eq.copy()
-        eq2["date"] = pd.to_datetime(eq2["date"])
-        eq2["nav"] = nav
-
-        periods = []
-
-        # 月度
-        monthly = eq2.resample("ME", on="date").agg({"nav": "last", "date": "last"}).dropna()
-        monthly["ret"] = monthly["nav"].pct_change()
-        for i in range(1, len(monthly)):
-            label = f"月度{i}"
-            s_date = str(monthly["date"].iloc[i - 1])[:10]
-            e_date = str(monthly["date"].iloc[i])[:10]
-            r = monthly["ret"].iloc[i]
-            periods.append((label, f"{s_date} ~ {e_date}", r))
-
-        # 年度
-        yearly = eq2.resample("YE", on="date").agg({"nav": "last", "date": "last"}).dropna()
-        yearly["ret"] = yearly["nav"].pct_change()
-        for i in range(1, len(yearly)):
-            label = f"年度{i}"
-            s_date = str(yearly["date"].iloc[i - 1])[:10]
-            e_date = str(yearly["date"].iloc[i])[:10]
-            r = yearly["ret"].iloc[i]
-            periods.append((label, f"{s_date} ~ {e_date}", r))
-
-        # 全期间
-        total_ret = nav.iloc[-1] / nav.iloc[0] - 1
-        periods.append((
-            "全期间",
-            f"{str(eq['date'].iloc[0])[:10]} ~ {str(eq['date'].iloc[-1])[:10]}",
-            total_ret,
-        ))
-
-        # 基准收益率（对齐）
-        bench_rets = {}
-        if benchmark_df is not None and not benchmark_df.empty:
-            bm = benchmark_df.drop_duplicates("date").sort_values("date").copy()
-            bm["date"] = pd.to_datetime(bm["date"])
-            bnav = bm["nav"].astype(float)
-            # 月度基准
-            bm_m = bm.resample("ME", on="date").agg({"nav": "last", "date": "last"}).dropna()
-            bm_m["ret"] = bm_m["nav"].pct_change()
-            for i in range(1, len(bm_m)):
-                key = f"月度{i}"
-                bench_rets[key] = bm_m["ret"].iloc[i]
-            # 年度基准
-            bm_y = bm.resample("YE", on="date").agg({"nav": "last", "date": "last"}).dropna()
-            bm_y["ret"] = bm_y["nav"].pct_change()
-            for i in range(1, len(bm_y)):
-                key = f"年度{i}"
-                bench_rets[key] = bm_y["ret"].iloc[i]
-            # 全期间基准
-            if len(bnav) >= 2:
-                bench_rets["全期间"] = bnav.iloc[-1] / bnav.iloc[0] - 1
-
-        self.return_table.setRowCount(len(periods))
-        for i, (label, dr, r) in enumerate(periods):
-            self.return_table.setItem(i, 0, QTableWidgetItem(label))
-            self.return_table.setItem(i, 1, QTableWidgetItem(dr))
-
-            r_str = f"{r * 100:.2f}%"
-            item = QTableWidgetItem(r_str)
-            if r >= 0:
-                item.setForeground(QColor("#00e676"))
-            else:
-                item.setForeground(QColor("#ff5252"))
-            self.return_table.setItem(i, 2, item)
-
-            # 基准
-            br = bench_rets.get(label)
-            if br is not None:
-                br_str = f"{br * 100:.2f}%"
-                bitem = QTableWidgetItem(br_str)
-                if br >= 0:
-                    bitem.setForeground(QColor("#00e676"))
-                else:
-                    bitem.setForeground(QColor("#ff5252"))
-                self.return_table.setItem(i, 3, bitem)
-            else:
-                self.return_table.setItem(i, 3, QTableWidgetItem("-"))
-
-        self.return_table.resizeColumnsToContents()
