@@ -211,6 +211,7 @@ class BacktestEngine:
                         return []
 
             df = sub.copy()
+            debug = {"raw": len(df)}
 
             # ══════════════════════════════════════════
             # 流动性过滤：20日均成交额 > 3000万
@@ -218,18 +219,22 @@ class BacktestEngine:
             liquidity_min = float(buy_rule.get("liquidity_min_amount", 0) or 0)
             if liquidity_min > 0 and "amount_ma20" in df.columns:
                 df = df[df["amount_ma20"] >= liquidity_min].copy()
+            debug["after_liquidity"] = len(df)
             if df.empty:
+                print(f"[select_on_date] {debug}")
                 return []
 
             try:
                 score = self.expr.eval(score_expr, df)
             except Exception as e:
-                print(f"[select_on_date] score_expr 评估失败: {score_expr!r}, 错误: {e}")
+                debug["error"] = str(e)
+                print(f"[select_on_date] score_expr 评估失败: {score_expr!r}, 错误: {e}, debug={debug}")
                 return []
             if score is None:
+                debug["error"] = "score is None"
+                print(f"[select_on_date] score_expr 返回 None, debug={debug}")
                 return []
             if isinstance(score, pd.DataFrame):
-                # 兜底：取第一列
                 score = score.iloc[:, 0] if score.shape[1] > 0 else pd.Series(dtype=float)
             if not isinstance(score, pd.Series):
                 score = pd.Series([float(score)] * len(df), index=df.index)
@@ -243,29 +248,13 @@ class BacktestEngine:
                     cond = None
                 if isinstance(cond, pd.Series):
                     df = df[cond.fillna(False)]
-
+            debug["after_filter_expr"] = len(df)
             if df.empty:
+                print(f"[select_on_date] filt_expr 后为空, debug={debug}")
                 return []
 
-            # 信号强度阈值：top1 vs top5 的差距（横截面gap，不受ETF数量变化影响）
-            # gap = (best_score - score_5th) / std，默认阈值0.5表示最强信号显著拉开差距
-            signal_threshold = buy_rule.get("signal_strength_threshold")
-            if signal_threshold is not None and len(df) >= 5:
-                scores = df["_score"].sort_values(ascending=False)
-                top1 = scores.iloc[0]
-                top5_idx = min(4, len(scores) - 1)
-                top5 = scores.iloc[top5_idx]
-                std_s = scores.std(ddof=0)
-                if std_s > 1e-12:
-                    gap = (top1 - top5) / std_s
-                    if gap < float(signal_threshold):
-                        return []  # 信号不够突出，空仓
-                else:
-                    return []  # 所有ETF得分相同
-            elif signal_threshold is not None and len(df) < 5:
-                pass  # 样本太少，不设阈值
-
             ranked = df.sort_values("_score", ascending=ascending)
+            debug["final"] = len(ranked)
             return ranked["code"].astype(str).tolist()
 
             factor = buy_rule.get("factor")
@@ -392,7 +381,8 @@ class BacktestEngine:
 
         # 预先生成：decision_date -> exec_date(open) 的选股结果
         desired: dict[str, list[str]] = {}
-        for i in range(0, len(dates) - 1):
+        total_decision_days = len(dates) - 1
+        for i in range(0, total_decision_days):
             decision_date = dates[i]
             exec_date = dates[i + 1]
             sub = data[data["date"] == decision_date]
@@ -400,6 +390,15 @@ class BacktestEngine:
             if not codes_sorted:
                 continue
             desired[exec_date] = codes_sorted
+
+        # ── 过滤链统计 ──
+        filter_stats = {
+            "halted": 0,
+            "liquidity_frozen": 0,
+            "corr_filtered": 0,
+            "exposure_zero": 0,
+            "exposure_partial": 0,
+        }
 
         cash = float(base_point)
         positions: dict[str, Position] = {}
@@ -538,13 +537,17 @@ class BacktestEngine:
 
                 # 筛选可交易标的
                 tradable: dict[str, float] = {}
+                effective_cash = cash  # 滑点估算用全仓现金，实盘下单时会被 exposure_mult 覆盖
+                raw_wt = {c: 1.0 / len(want) for c in want} if want else {}  # 滑点估算用等权，实盘下单时会被 HRP/inv_vol 覆盖
                 for code in want:
                     if code not in day.index:
                         halted_codes.add(code)
+                        filter_stats["halted"] += 1
                         continue
                     open_price = self._safe_scalar(day_open.get(code, np.nan))
                     if pd.isna(open_price):
                         halted_codes.add(code)
+                        filter_stats["halted"] += 1
                         continue
                     raw_price = float(open_price)
                     est_notional = effective_cash * raw_wt.get(code, 0)
@@ -562,6 +565,7 @@ class BacktestEngine:
                             vol = self._safe_scalar(row["volume"].iloc[0]) if "volume" in row.columns else 0
                             if (pd.notna(o) and pd.notna(c) and o == c == h == l
                                     and pd.notna(vol) and vol < 100):
+                                filter_stats["liquidity_frozen"] += 1
                                 continue  # 流动性冻结，跳过
                     except (KeyError, ValueError, TypeError, IndexError):
                         pass
@@ -626,6 +630,11 @@ class BacktestEngine:
 
                     effective_cash = cash * exposure_mult
 
+                    if exposure_mult == 0:
+                        filter_stats["exposure_zero"] += 1
+                    elif exposure_mult < 1.0:
+                        filter_stats["exposure_partial"] += 1
+
                     # ══════════════════════════════════════════
                     # 组合层风控3：相关性约束（防同质化持仓）
                     # 如果候选ETF与已持仓ETF的corr_hs300差距<0.1，视为同质→跳过
@@ -642,6 +651,7 @@ class BacktestEngine:
                                 pass
                         if held_corrs:
                             tradable_filtered = {}
+                            corr_dropped = 0
                             for code, px in tradable.items():
                                 try:
                                     tc = self._safe_scalar(day_corr.get(code, np.nan))
@@ -657,6 +667,9 @@ class BacktestEngine:
                                 )
                                 if not too_close:
                                     tradable_filtered[code] = px
+                                else:
+                                    corr_dropped += 1
+                            filter_stats["corr_filtered"] += corr_dropped
                             if tradable_filtered:
                                 tradable = tradable_filtered
 
@@ -810,11 +823,56 @@ class BacktestEngine:
 
         metrics = self.calc_metrics(equity_df, trades)
 
+        # ── 策略有效性指标 ──
+        signal_days = sum(1 for v in desired.values() if v)
+        total_days = max(len(dates), 1)
+        holding_days = sum(
+            1 for r in equity_rows
+            if r.get("positions", 0) > 0
+        )
+        avg_candidates = (
+            sum(len(v) for v in desired.values() if v) / max(signal_days, 1)
+        )
+        trades_count = len(trades)
+        years = max(total_days / 252.0, 0.5)
+        avg_equity = float(equity_df["equity"].mean()) if not equity_df.empty else base_point
+
+        turn = 0.0
+        if trades_count > 0 and avg_equity > 0:
+            trades_df = pd.DataFrame(trades)
+            if not trades_df.empty and "sell_price" in trades_df.columns and "shares" in trades_df.columns:
+                sell_notionals = trades_df["sell_price"].astype(float) * trades_df["shares"].astype(float)
+                total_sell_notional = float(sell_notionals.sum())
+                turn = (total_sell_notional / avg_equity) / years
+
+        effectiveness = {
+            "signal_days_ratio": signal_days / max(total_decision_days, 1),
+            "avg_candidates": float(avg_candidates),
+            "invested_ratio": holding_days / total_days,
+            "empty_days_ratio": 1.0 - holding_days / total_days,
+            "trade_frequency": trades_count / years,
+            "total_days": total_days,
+            "signal_days": signal_days,
+            "trades_total": trades_count,
+        }
+
+        # ── 过滤链杀伤率 ──
+        total_want = sum(len(desired.get(d, [])) for d in dates if d in desired)
+        filter_chain = {
+            **filter_stats,
+            "total_want": total_want,
+            "halted_pct": filter_stats["halted"] / max(total_want, 1),
+            "exposure_zero_pct": filter_stats["exposure_zero"] / max(len(dates), 1),
+            "exposure_partial_pct": filter_stats["exposure_partial"] / max(len(dates), 1),
+        }
+
         return {
             "trades": pd.DataFrame(trades),
             "equity": equity_df,
             "benchmark": bench_df,
-            "metrics": metrics,
+            "metrics": {**metrics, **effectiveness, "filter_chain": filter_chain},
+            "effectiveness": effectiveness,
+            "filter_chain": filter_chain,
         }
 
     # =====================================

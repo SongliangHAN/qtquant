@@ -28,21 +28,34 @@ def _safe_float(x, default=0.0) -> float:
 def hard_filter(metrics: dict) -> bool:
     """
     硬过滤：任一条件不满足则淘汰。
-    - annual_return >= 0.10
-    - max_drawdown > -0.35
-    - turnover in [0.1, 20.0] （真实组合换手率，年化）
+    包括传统收益/风控指标 + 策略有效性指标（防空仓/低信号）
     """
     ann_ret = _safe_float(metrics.get("annual_return", 0.0))
     max_dd = _safe_float(metrics.get("max_drawdown", -1.0))
     turnover = _safe_float(metrics.get("turnover", 0.0))
+    trades_total = int(metrics.get("trades_total", 0) or 0)
+    invested_ratio = _safe_float(metrics.get("invested_ratio", 0.0))
+    signal_days_ratio = _safe_float(metrics.get("signal_days_ratio", 0.0))
+    avg_candidates = _safe_float(metrics.get("avg_candidates", 0.0))
 
-    if ann_ret < 0.10:
+    # 传统指标
+    if ann_ret < 0.05:
         return False
-    if max_dd < -0.35:
+    if max_dd < -0.50:
         return False
-    if turnover < 0.1:   # 几乎不交易 → 数据问题或过度持仓
+
+    # 策略有效性：宽松门槛，靠 Pareto 前沿筛选
+    if trades_total < 10:
         return False
-    if turnover > 20.0:  # 过度换手 → 交易成本不可持续
+    if invested_ratio < 0.15:
+        return False
+    if signal_days_ratio < 0.20:
+        return False
+    if avg_candidates < 1.5:
+        return False
+
+    # 换手率合理性
+    if turnover > 20.0:
         return False
     return True
 
@@ -219,7 +232,7 @@ def staged_optimization(
     train_days: int = 504,
     test_days: int = 252,
     top_k: int = 10,
-    max_search_date: str = "2025-12-31",
+    max_search_date: str = "2023-12-31",
     commission_bps: float = 1.0,
     slippage_bps: float = 2.0,
     progress_cb: Optional[Callable[[int, int, float], None]] = None,
@@ -286,6 +299,7 @@ def staged_optimization(
         stg = build_strategy(params)
         fold_metrics_list = []
         fold_pareto_list = []
+        last_fc = {}
 
         for j, (train_dates, test_dates) in enumerate(folds):
             test_df = df[df["date"].isin(test_dates)]
@@ -299,6 +313,7 @@ def staged_optimization(
                 )
                 m = test_res.get("metrics", {})
                 m["years"] = len(test_dates) / 252.0
+                last_fc = test_res.get("filter_chain", {})
             except Exception:
                 import traceback
                 print(f"[staged_optimization] 回测异常 trial={i+1} fold={j+1}\n{traceback.format_exc()}")
@@ -312,7 +327,15 @@ def staged_optimization(
             fold_pareto_list.append(_pareto_keys(m))
 
         if not fold_metrics_list:
-            all_detail.append({"trial": i + 1, "params": params, "passed": False, "reason": "all folds rejected"})
+            all_detail.append({
+                "trial": i + 1, "params": params, "passed": False,
+                "reason": "all folds rejected",
+                "filter_chain": {
+                    "halted_pct": round(last_fc.get("halted_pct", 0), 3),
+                    "exposure_zero_pct": round(last_fc.get("exposure_zero_pct", 0), 3),
+                    "total_want": last_fc.get("total_want", 0),
+                },
+            })
             continue
 
         # Mean pareto metrics across folds

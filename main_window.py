@@ -656,161 +656,159 @@ class MainWindow(QMainWindow):
         return page
 
     def _on_fl_compute(self):
-        """执行因子研究计算并绘制结果。"""
+        """后台执行因子研究计算（不阻塞UI）。"""
         selected = [f for f, cb in self.fl_factor_checks.items() if cb.isChecked()]
         if not selected:
             QMessageBox.warning(self, "提示", "请至少选择一个因子")
             return
 
+        codes = [x["code"] for x in self.ds.get_all_etf()]
         horizon = self.fl_horizon.value()
         window = self.fl_window.value()
         n_q = self.fl_n_quantiles.value()
         self.fl_compute_btn.setEnabled(False)
         self.fl_compute_btn.setText("计算中...")
-        QApplication.processEvents()
 
-        try:
-            # 加载数据
-            codes = [x["code"] for x in self.ds.get_all_etf()]
-            data = self.research.load_many(codes, start="2015-01-01")
-            if data.empty:
-                QMessageBox.warning(self, "提示", "没有可用的研究数据")
-                return
+        self._fl_selected = selected
+        self._fl_horizon = horizon
+        self._fl_n_q = n_q
 
-            lab = FactorLab(data)
+        worker = FactorLabWorker(
+            codes=codes, research=self.research,
+            selected=selected, horizon=horizon,
+            window=window, n_quantiles=n_q)
+        worker.signals.finished.connect(self._on_fl_finished, Qt.QueuedConnection)
+        worker.signals.failed.connect(self._on_fl_failed, Qt.QueuedConnection)
+        self._fl_worker = worker
+        QThreadPool.globalInstance().start(worker)
 
-            # ── Rolling IC ──
-            ic_df = lab.compute_rolling_ic(factors=selected, horizon=horizon, window=window)
-            self.fl_ic_plot.clear()
-            self.fl_ic_plot.addLegend()
-            if not ic_df.empty:
-                colors = ["#40c4ff", "#ffd54f", "#00e676", "#ff4081", "#ffab40"]
-                for idx, col in enumerate([c for c in ic_df.columns if c != "date"]):
-                    y = ic_df[col].values
-                    x = ic_df["date"].values.astype("datetime64[s]").astype(int)
-                    pen = pg.mkPen(color=colors[idx % len(colors)], width=1.5)
-                    self.fl_ic_plot.plot(x, y, pen=pen, name=col.replace("ic_", ""))
+    def _on_fl_failed(self, msg: str):
+        self.fl_compute_btn.setEnabled(True)
+        self.fl_compute_btn.setText("开始计算")
+        QMessageBox.warning(self, "因子研究错误", msg)
 
-            # ── IC Decay ──
-            decay_df = lab.compute_ic_decay(factors=selected, horizons=[1, 5, 10, 20])
-            self.fl_decay_plot.clear()
-            self.fl_decay_plot.addLegend()
-            if not decay_df.empty:
-                colors = ["#40c4ff", "#ffd54f", "#00e676", "#ff4081", "#ffab40"]
-                for idx, row in decay_df.iterrows():
-                    factor = row["factor"]
-                    x = [1, 5, 10, 20]
-                    y = [row.get(f"h{h}", np.nan) for h in x]
-                    pen = pg.mkPen(color=colors[idx % len(colors)], width=2)
-                    sym = pg.ScatterPlotItem(x=x, y=y, pen=pen, brush=colors[idx % len(colors)],
-                                              size=10, name=factor)
-                    self.fl_decay_plot.addItem(sym)
-                    self.fl_decay_plot.plot(x, y, pen=pen)
+    def _on_fl_finished(self, results: dict):
+        ic_df = results.get("ic", pd.DataFrame())
+        decay_df = results.get("decay", pd.DataFrame())
+        q_df = results.get("quantile", pd.DataFrame())
+        corr_df = results.get("corr", pd.DataFrame())
+        regime_df = results.get("regime", pd.DataFrame())
 
-            # ── Quantile Return ──
-            if selected:
-                q_df = lab.compute_quantile_returns(factor=selected[0], horizon=horizon, n_quantiles=n_q)
-                self.fl_quantile_plot.clear()
-                self.fl_quantile_plot.addLegend()
-                if not q_df.empty:
-                    cmap = ["#2d8cf0", "#40c4ff", "#69f0ae", "#ffd54f", "#ff4081"]
-                    for idx, col in enumerate(sorted(q_df.columns)):
-                        if col.startswith("q"):
-                            y = q_df[col].values
-                            x = q_df.index.values.astype("datetime64[s]").astype(int)
-                            pen = pg.mkPen(color=cmap[idx % len(cmap)], width=1.5)
-                            self.fl_quantile_plot.plot(x, y, pen=pen, name=f"{selected[0]} {col}")
+        selected = self._fl_selected
+        horizon = self._fl_horizon
+        n_q = self._fl_n_q
 
-            # ── Factor Correlation ──
-            corr_df = lab.compute_factor_correlation(factors=selected)
-            self.fl_corr_plot.clear()
-            if not corr_df.empty:
-                n = len(corr_df)
-                img = pg.ImageItem()
-                img.setImage(corr_df.values)
-                # Center the image at row/column indices
-                img.setRect(-0.5, -0.5, n, n)
-                # Custom color map: blue to white to red
-                from pyqtgraph import ColorMap
-                cmap = pg.colormap.get("coolwarm")
-                if cmap is None:
-                    lut_vals = []
-                    for i in range(256):
-                        r = int(255 * (i / 255.0))
-                        g = int(255 * (1.0 - abs(i - 127.5) / 127.5))
-                        b = int(255 * (1.0 - i / 255.0))
-                        lut_vals.append([r, g, b])
-                    cmap = ColorMap(np.array(lut_vals, dtype=np.ubyte))
-                img.setLookupTable(cmap.getLookupTable())
-                self.fl_corr_plot.addItem(img)
+        # ── Rolling IC ──
+        self.fl_ic_plot.clear()
+        self.fl_ic_plot.addLegend()
+        if not ic_df.empty:
+            colors = ["#40c4ff", "#ffd54f", "#00e676", "#ff4081", "#ffab40"]
+            for idx, col in enumerate([c for c in ic_df.columns if c != "date"]):
+                y = ic_df[col].values
+                x = ic_df["date"].values.astype("datetime64[s]").astype(int)
+                pen = pg.mkPen(color=colors[idx % len(colors)], width=1.5)
+                self.fl_ic_plot.plot(x, y, pen=pen, name=col.replace("ic_", ""))
 
-                # Labels
-                tick_positions = [(i, name) for i, name in enumerate(corr_df.index)]
-                ax = self.fl_corr_plot.getAxis("bottom")
-                ax.setTicks([tick_positions])
-                ay = self.fl_corr_plot.getAxis("left")
-                ay.setTicks([tick_positions])
+        # ── IC Decay ──
+        self.fl_decay_plot.clear()
+        self.fl_decay_plot.addLegend()
+        if not decay_df.empty:
+            colors = ["#40c4ff", "#ffd54f", "#00e676", "#ff4081", "#ffab40"]
+            for idx, row in decay_df.iterrows():
+                factor = row["factor"]
+                x = [1, 5, 10, 20]
+                y = [row.get(f"h{h}", np.nan) for h in x]
+                pen = pg.mkPen(color=colors[idx % len(colors)], width=2)
+                sym = pg.ScatterPlotItem(x=x, y=y, pen=pen, brush=colors[idx % len(colors)],
+                                          size=10, name=factor)
+                self.fl_decay_plot.addItem(sym)
+                self.fl_decay_plot.plot(x, y, pen=pen)
 
-            # ── Regime IC ──
-            regime_df = lab.compute_regime_ic(factors=selected, horizon=horizon)
-            self.fl_regime_plot.clear()
-            self.fl_regime_plot.addLegend()
-            if not regime_df.empty:
-                regimes_list = regime_df.columns.drop("factor", errors="ignore").tolist()
-                bar_width = 0.15
-                colors = ["#40c4ff", "#ffd54f", "#00e676", "#ff4081", "#ffab40"]
-                for r_idx, regime_name in enumerate(regimes_list):
-                    for f_idx, row in regime_df.iterrows():
-                        factor_name = row["factor"]
-                        val = row.get(regime_name, np.nan)
-                        if not np.isnan(val):
-                            x_pos = f_idx + r_idx * bar_width
-                            bar = pg.BarGraphItem(
-                                x=[x_pos], height=[val], width=bar_width,
-                                brush=colors[r_idx % len(colors)], name=regime_name
-                            )
-                            self.fl_regime_plot.addItem(bar)
+        # ── Quantile Return ──
+        if selected and not q_df.empty:
+            self.fl_quantile_plot.clear()
+            self.fl_quantile_plot.addLegend()
+            cmap = ["#2d8cf0", "#40c4ff", "#69f0ae", "#ffd54f", "#ff4081"]
+            for idx, col in enumerate(sorted(q_df.columns)):
+                if col.startswith("q"):
+                    y = q_df[col].values
+                    x = q_df.index.values.astype("datetime64[s]").astype(int)
+                    pen = pg.mkPen(color=cmap[idx % len(cmap)], width=1.5)
+                    self.fl_quantile_plot.plot(x, y, pen=pen, name=f"{selected[0]} {col}")
 
-                # X-axis ticks at factor positions
-                x_ticks = [(i + bar_width * (len(regimes_list) - 1) / 2,
-                            regime_df["factor"].iloc[i]) for i in range(len(regime_df))]
-                self.fl_regime_plot.getAxis("bottom").setTicks([x_ticks])
+        # ── Factor Correlation ──
+        self.fl_corr_plot.clear()
+        if not corr_df.empty:
+            n = len(corr_df)
+            img = pg.ImageItem()
+            img.setImage(corr_df.values)
+            img.setRect(-0.5, -0.5, n, n)
+            from pyqtgraph import ColorMap
+            cmap = pg.colormap.get("coolwarm")
+            if cmap is None:
+                lut_vals = []
+                for i in range(256):
+                    r = int(255 * (i / 255.0))
+                    g = int(255 * (1.0 - abs(i - 127.5) / 127.5))
+                    b = int(255 * (1.0 - i / 255.0))
+                    lut_vals.append([r, g, b])
+                cmap = ColorMap(np.array(lut_vals, dtype=np.ubyte))
+            img.setLookupTable(cmap.getLookupTable())
+            self.fl_corr_plot.addItem(img)
+            tick_positions = [(i, name) for i, name in enumerate(corr_df.index)]
+            self.fl_corr_plot.getAxis("bottom").setTicks([tick_positions])
+            self.fl_corr_plot.getAxis("left").setTicks([tick_positions])
 
-            # ── 汇总表格 ──
-            self.fl_summary_table.clear()
-            if not ic_df.empty:
-                ic_cols = [c for c in ic_df.columns if c != "date"]
-                # 最近的滚动IC值
-                last_row = ic_df.dropna().iloc[-1] if len(ic_df.dropna()) > 0 else None
-                if last_row is not None:
-                    rows = len(ic_cols)
-                    self.fl_summary_table.setRowCount(rows)
-                    self.fl_summary_table.setColumnCount(4)
-                    self.fl_summary_table.setHorizontalHeaderLabels(["因子", "最新RollingIC", "ICIR", "Mean IC (Decay h5)"])
-                    for i, col in enumerate(ic_cols):
-                        factor_name = col.replace("ic_", "")
-                        ic_val = last_row.get(col, np.nan)
-                        ic_series = ic_df[col].dropna()
-                        icir = ic_series.mean() / ic_series.std() if len(ic_series) > 1 and ic_series.std() > 0 else np.nan
-                        decay_h5 = np.nan
-                        if not decay_df.empty:
-                            dr = decay_df[decay_df["factor"] == factor_name]
-                            if len(dr) > 0:
-                                decay_h5 = dr["h5"].iloc[0]
+        # ── Regime IC ──
+        self.fl_regime_plot.clear()
+        self.fl_regime_plot.addLegend()
+        if not regime_df.empty:
+            regimes_list = regime_df.columns.drop("factor", errors="ignore").tolist()
+            bar_width = 0.15
+            colors = ["#40c4ff", "#ffd54f", "#00e676", "#ff4081", "#ffab40"]
+            for r_idx, regime_name in enumerate(regimes_list):
+                for f_idx, row in regime_df.iterrows():
+                    val = row.get(regime_name, np.nan)
+                    if not np.isnan(val):
+                        bar = pg.BarGraphItem(
+                            x=[f_idx + r_idx * bar_width], height=[val], width=bar_width,
+                            brush=colors[r_idx % len(colors)], name=regime_name
+                        )
+                        self.fl_regime_plot.addItem(bar)
+            x_ticks = [(i + bar_width * (len(regimes_list) - 1) / 2,
+                        regime_df["factor"].iloc[i]) for i in range(len(regime_df))]
+            self.fl_regime_plot.getAxis("bottom").setTicks([x_ticks])
 
-                        self.fl_summary_table.setItem(i, 0, QTableWidgetItem(factor_name))
-                        self.fl_summary_table.setItem(i, 1,
-                            QTableWidgetItem(f"{ic_val:.4f}" if not np.isnan(ic_val) else "N/A"))
-                        self.fl_summary_table.setItem(i, 2,
-                            QTableWidgetItem(f"{icir:.4f}" if not np.isnan(icir) else "N/A"))
-                        self.fl_summary_table.setItem(i, 3,
-                            QTableWidgetItem(f"{decay_h5:.4f}" if not np.isnan(decay_h5) else "N/A"))
+        # ── 汇总表格 ──
+        self.fl_summary_table.clear()
+        if not ic_df.empty:
+            ic_cols = [c for c in ic_df.columns if c != "date"]
+            last_row = ic_df.dropna().iloc[-1] if len(ic_df.dropna()) > 0 else None
+            if last_row is not None:
+                rows = len(ic_cols)
+                self.fl_summary_table.setRowCount(rows)
+                self.fl_summary_table.setColumnCount(4)
+                self.fl_summary_table.setHorizontalHeaderLabels(["因子", "最新RollingIC", "ICIR", "Mean IC (Decay h5)"])
+                for i, col in enumerate(ic_cols):
+                    factor_name = col.replace("ic_", "")
+                    ic_val = last_row.get(col, np.nan)
+                    ic_series = ic_df[col].dropna()
+                    icir = ic_series.mean() / ic_series.std() if len(ic_series) > 1 and ic_series.std() > 0 else np.nan
+                    decay_h5 = np.nan
+                    if not decay_df.empty:
+                        dr = decay_df[decay_df["factor"] == factor_name]
+                        if len(dr) > 0:
+                            decay_h5 = dr["h5"].iloc[0]
+                    self.fl_summary_table.setItem(i, 0, QTableWidgetItem(factor_name))
+                    self.fl_summary_table.setItem(i, 1,
+                        QTableWidgetItem(f"{ic_val:.4f}" if not np.isnan(ic_val) else "N/A"))
+                    self.fl_summary_table.setItem(i, 2,
+                        QTableWidgetItem(f"{icir:.4f}" if not np.isnan(icir) else "N/A"))
+                    self.fl_summary_table.setItem(i, 3,
+                        QTableWidgetItem(f"{decay_h5:.4f}" if not np.isnan(decay_h5) else "N/A"))
 
-        except Exception as e:
-            QMessageBox.warning(self, "计算错误", str(e))
-        finally:
-            self.fl_compute_btn.setEnabled(True)
-            self.fl_compute_btn.setText("开始计算")
+        self.fl_compute_btn.setEnabled(True)
+        self.fl_compute_btn.setText("开始计算")
 
     # ==========================================
     # 数据下载页面
@@ -1485,13 +1483,11 @@ class MainWindow(QMainWindow):
         opt_box = QGroupBox("走样本外优化参数（训练2年/测试1年；每段测试需进入TopK；2025年后不参与搜索）")
         opt_layout = QGridLayout(opt_box)
         self.opt_train = QSpinBox()
-        self.opt_train.setRange(200, 2000)
+        self.opt_train.setRange(100, 2000)
         self.opt_train.setValue(504)  # 约2年交易日
-        self.opt_train.setEnabled(False)
         self.opt_test = QSpinBox()
-        self.opt_test.setRange(100, 1000)
+        self.opt_test.setRange(60, 1000)
         self.opt_test.setValue(252)   # 约1年交易日
-        self.opt_test.setEnabled(False)
         self.opt_trials = QSpinBox()
         self.opt_trials.setRange(5, 2000)
         self.opt_trials.setValue(300)
@@ -1507,7 +1503,7 @@ class MainWindow(QMainWindow):
         opt_layout.addWidget(QLabel("每段TopK"), 1, 2)
         opt_layout.addWidget(self.opt_topk, 1, 3)
         opt_layout.addWidget(QLabel("搜索截止日期"), 2, 0)
-        self.opt_cutoff = QLineEdit("2025-12-31")
+        self.opt_cutoff = QLineEdit("2023-12-31")
         opt_layout.addWidget(self.opt_cutoff, 2, 3)
         layout.addWidget(opt_box)
 
@@ -1550,6 +1546,10 @@ class MainWindow(QMainWindow):
 
     def build_backtest_page(self):
 
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+
         page = QWidget()
 
         layout = QVBoxLayout(page)
@@ -1571,18 +1571,6 @@ class MainWindow(QMainWindow):
         self.bt_start = QLineEdit("")
         self.bt_end = QLineEdit("")
 
-        self.comm_spin = QDoubleSpinBox()
-        self.comm_spin.setRange(0, 100)
-        self.comm_spin.setDecimals(2)
-        self.comm_spin.setValue(1.0)
-        self.comm_spin.setSuffix(" bps")
-
-        self.slip_spin = QDoubleSpinBox()
-        self.slip_spin.setRange(0, 100)
-        self.slip_spin.setDecimals(2)
-        self.slip_spin.setValue(2.0)
-        self.slip_spin.setSuffix(" bps")
-
         top.addWidget(QLabel("本地策略"), 0, 0)
         top.addWidget(self.strategy_combo, 0, 1)
         top.addWidget(self.refresh_strategies_btn, 0, 2)
@@ -1592,10 +1580,6 @@ class MainWindow(QMainWindow):
         top.addWidget(self.bt_start, 2, 1)
         top.addWidget(QLabel("结束日期(可空)"), 2, 2)
         top.addWidget(self.bt_end, 2, 3)
-        top.addWidget(QLabel("手续费"), 3, 0)
-        top.addWidget(self.comm_spin, 3, 1)
-        top.addWidget(QLabel("滑点"), 3, 2)
-        top.addWidget(self.slip_spin, 3, 3)
 
         layout.addLayout(top)
 
@@ -1626,7 +1610,8 @@ class MainWindow(QMainWindow):
         self.run_backtest_btn.clicked.connect(self.run_backtest)
         self.refresh_strategy_list()
 
-        return page
+        scroll.setWidget(page)
+        return scroll
 
     # ==========================================
     # 策略构建 / 回测辅助
@@ -1676,7 +1661,7 @@ class MainWindow(QMainWindow):
         self.strategy_progress.setFormat("准备中...")
 
         factors = self.get_factor_candidates()
-        cutoff = self.normalize_date_input(self.opt_cutoff.text()) or "2025-12-31"
+        cutoff = self.normalize_date_input(self.opt_cutoff.text()) or "2023-12-31"
 
         train_days = int(self.opt_train.value())
         test_days = int(self.opt_test.value())
@@ -1686,7 +1671,6 @@ class MainWindow(QMainWindow):
         # 搜索空间（仅可优化参数，固定权重不参与搜索）
         space = {
             "top_n":                  [1, 2, 3, 4, 5],
-            "entry_rank_threshold":   [0, 0.5, 0.6, 0.7, 0.8],
             "exit_rank_threshold":    [0, 0.1, 0.2, 0.3, 0.4],
             "breadth_threshold":      [0.15, 0.20, 0.25, 0.30, 0.35, 0.40],
             "stop_loss":              [0, 0.03, 0.05, 0.08, 0.12],
@@ -1695,7 +1679,6 @@ class MainWindow(QMainWindow):
 
         def build_strategy(params: dict):
             top_n = int(params.get("top_n", 3))
-            entry_q = float(params.get("entry_rank_threshold", 0) or 0)
             exit_q = float(params.get("exit_rank_threshold", 0) or 0)
             stop_loss = float(params.get("stop_loss", 0) or 0)
 
@@ -1713,15 +1696,15 @@ class MainWindow(QMainWindow):
 
             def _group_mean(factors):
                 if len(factors) == 1:
-                    return f"_r_{factors[0]}"
+                    return f"_z_{factors[0]}"
                 n = len(factors)
-                return "(" + " + ".join(f"_r_{f}" for f in factors) + f") / {n}"
+                return "(" + " + ".join(f"_z_{f}" for f in factors) + f") / {n}"
 
             trend_score    = _group_mean(_trend_raw)
             risk_score     = _group_mean(_risk_raw)
             volume_score   = _group_mean(_vol_raw)
             structure_score = _group_mean(_struct_raw)
-            mean_rev_score = "_r_ma_distance"
+            mean_rev_score = "_z_ma_distance"
 
             # ── 固定 Regime 权重（不可优化）──
             # ── 动态因子权重（由 FactorMonitor 预计算为 dw_* 列）──
@@ -1729,7 +1712,7 @@ class MainWindow(QMainWindow):
             # 若 dw_* 列缺失则回退到默认等权 0.2
 
             # Bear/panic 中 structure 改为 beta 偏离惩罚
-            struct_bear_expr = f"( _r_beta_penalty + _r_corr_hs300_60 ) / 2"
+            struct_bear_expr = f"( _z_beta_penalty + _z_corr_hs300_60 ) / 2"
 
             bull_expr = (
                 f"dw_trend * {trend_score} + "
@@ -1760,7 +1743,7 @@ class MainWindow(QMainWindow):
             )
             bt = float(params.get("breadth_threshold", 0.30))
             score_expr = f"where(breadth < {bt:.2f}, " + bear_expr + ", " + regime_expr + ")"
-            filter_expr = f"rank({score_expr}) > {entry_q}" if entry_q else ""
+            filter_expr = ""
             ascending = False
 
             # ===== 卖出：rebalance + signal_deterioration + risk_exit =====
@@ -1786,7 +1769,6 @@ class MainWindow(QMainWindow):
                     "filter_expr": filter_expr,
                     "top_n": top_n,
                     "ascending": ascending,
-                    "signal_strength_threshold": 0.6,
                     "liquidity_min_amount": 30000000,
                     "market_filter": {
                         "enabled": True,
@@ -1831,57 +1813,34 @@ class MainWindow(QMainWindow):
                 },
             }
 
-        def build_data_fn():
-            codes = [x["code"] for x in self.ds.get_all_etf()]
-            data = self.build_backtest_data(codes)
-            if data is None or data.empty:
-                return data
-            # 加速：先过滤一遍（避免构造太多fold）
-            data = data[data["date"] <= cutoff].copy()
-
-            # 预计算逐日截面排名，避免每次 trial 都重复 rank()
-            skip_cols = {"code", "date", "regime", "breadth", "amount",
-                         "close", "open", "high", "low", "volume", "amount_ma20"}
-            for col in data.columns:
-                if col in skip_cols or not col.isidentifier():
-                    continue
-                try:
-                    data[f"_r_{col}"] = data.groupby("date")[col].transform(
-                        lambda x: x.rank(pct=True))
-                except Exception:
-                    pass
-
-            # 预计算 Bear 模式的 beta 偏离惩罚 rank
-            try:
-                data["_r_beta_penalty"] = data.groupby("date")["barra_beta"].transform(
-                    lambda x: (-abs(x - 1.0)).rank(pct=True))
-            except Exception:
-                pass
-
-            # 预计算动态因子权重（Rolling RankIC → ICIR → 归一化权重）
-            try:
-                from factor_monitor import FactorMonitor
-                fm = FactorMonitor(data)
-                dw_df = fm.compute_weights(fwd_days=5, ic_window=60)
-                if not dw_df.empty:
-                    dw_cols = [c for c in dw_df.columns if c.startswith("dw_")]
-                    data = data.merge(dw_df[["date"] + dw_cols], on="date", how="left")
-                    # 前向填充缺失值（初始窗口期 IC 不足）
-                    for c in dw_cols:
-                        if c in data.columns:
-                            data[c] = data[c].fillna(data[c].mean() if data[c].notna().any() else 0.2)
-            except Exception:
-                pass
-
-            return data
-
         self.strategy_build_log.append(
             f"开始三阶段搜索：次数={n_trials} | TopK={top_k} | 截止={cutoff}"
         )
 
+        # 预检：确保数据包含 _z_* 截面 zscore 和 dw_* 动态权重列
+        codes = [x["code"] for x in self.ds.get_all_etf()]
+        check_data = self.build_backtest_data(codes)
+        if check_data is not None and not check_data.empty:
+            check_data = check_data[check_data["date"] <= cutoff].copy()
+        if check_data is None or check_data.empty:
+            QMessageBox.warning(self, "数据不足", "没有可用于优化的研究数据，请先下载数据并计算因子。")
+            self.optimize_btn.setEnabled(True)
+            self.cancel_optimize_btn.setEnabled(False)
+            self.cancel_optimize_btn.hide()
+            return
+        dw_cols = [c for c in check_data.columns if c.startswith("dw_")]
+        z_cols = [c for c in check_data.columns if c.startswith("_z_")]
+        self.strategy_build_log.append(
+            f"数据准备完成：{check_data['code'].nunique()} 只ETF | "
+            f"日期数 {check_data['date'].nunique()} | "
+            f"dw_* 列 {len(dw_cols)} | _z_* 列 {len(z_cols)}"
+        )
+        if not dw_cols:
+            self.strategy_build_log.append("⚠ 警告：未找到 dw_* 动态权重列，表达式将退回到默认等权 0.2")
+
         worker = OptimizerWorker(
             staged_optimization,
-            build_data_fn=build_data_fn,
+            data=check_data,
             build_strategy_fn=build_strategy,
             space=space,
             config={
@@ -1892,8 +1851,8 @@ class MainWindow(QMainWindow):
                 "test_days": test_days,
                 "top_k": top_k,
                 "max_search_date": cutoff,
-                "commission_bps": float(self.comm_spin.value()),
-                "slippage_bps": float(self.slip_spin.value()),
+                "commission_bps": 1.0,
+                "slippage_bps": 2.0,
             },
         )
         # IMPORTANT: 保留引用，避免任务运行中被GC
@@ -2075,12 +2034,17 @@ class MainWindow(QMainWindow):
         # 统一使用预计算 research parquet
         # ══════════════════════════════════════════
         codes_available = [c for c in codes if self.research.exists(c)]
-        if len(codes_available) < max(1, len(codes) // 2):
-            return pd.DataFrame()  # 数据不足，由调用方提示用户
+        codes_missing = len(codes) - len(codes_available)
+        if codes_missing > 0:
+            print(f"[build_backtest_data] {codes_missing}/{len(codes)} 只ETF缺少研究数据 (已下载: {len(codes_available)})")
+        if len(codes_available) < 3:
+            return pd.DataFrame()  # 数据严重不足（少于3只）
 
-        data = self.research.load_many(codes, start=start, end=end)
+        data = self.research.load_many(codes_available, start=start, end=end)
         if data.empty:
             return pd.DataFrame()
+        codes_loaded = data["code"].nunique()
+        print(f"[build_backtest_data] 实际加载 {codes_loaded} 只ETF, {len(data)} 行")
 
         # 补充流动性指标
         if "amount" in data.columns:
@@ -2088,6 +2052,57 @@ class MainWindow(QMainWindow):
                 data.groupby("code")["amount"]
                 .transform(lambda x: x.rolling(20, min_periods=5).mean())
             )
+
+        # 预计算逐日截面 zscore _z_* 列（保留分布离散度，避免 rank 嵌套压缩）
+        skip_cols = {"code", "date", "regime", "regime_raw", "breadth", "amount",
+                     "close", "open", "high", "low", "volume", "amount_ma20"}
+        z_ok = 0
+        z_fail = 0
+        for col in data.columns:
+            if col in skip_cols or not col.isidentifier():
+                continue
+            # 只对数值列做 zscore（跳过字符串/对象列）
+            if not pd.api.types.is_numeric_dtype(data[col]):
+                continue
+            try:
+                z = data.groupby("date")[col].transform(
+                    lambda x: (x - x.mean()) / (x.std() if x.std() != 0 else 1))
+                data[f"_z_{col}"] = z
+                z_ok += 1
+            except Exception as e:
+                z_fail += 1
+                if z_fail <= 3:
+                    import traceback
+                    print(f"[build_backtest_data] _z_ 失败 col={col!r}: {e}\n{traceback.format_exc()}")
+        print(f"[build_backtest_data] _z_* 创建 {z_ok} 列, 跳过/失败 {z_fail}")
+
+        # 预计算 Bear 模式的 beta 偏离惩罚 zscore（beta=1最优，偏离越大分值越低）
+        if "barra_beta" in data.columns:
+            try:
+                dev = -abs(data["barra_beta"] - 1.0)
+                dev_mean = dev.groupby(data["date"]).transform("mean")
+                dev_std = dev.groupby(data["date"]).transform("std").replace(0, 1)
+                data["_z_beta_penalty"] = (dev - dev_mean) / dev_std
+            except Exception as e:
+                print(f"[build_backtest_data] _z_beta_penalty 失败: {e}")
+
+        # 预计算动态因子权重（Rolling RankIC → ICIR → 归一化权重）
+        try:
+            from factor_monitor import FactorMonitor
+            fm = FactorMonitor(data)
+            dw_df = fm.compute_weights(fwd_days=5, ic_window=60)
+            if not dw_df.empty:
+                dw_cols = [c for c in dw_df.columns if c.startswith("dw_")]
+                data = data.merge(dw_df[["date"] + dw_cols], on="date", how="left")
+                for c in dw_cols:
+                    if c in data.columns:
+                        data[c] = data[c].fillna(data[c].mean() if data[c].notna().any() else 0.2)
+                print(f"[build_backtest_data] dw_* 创建 {len(dw_cols)} 列: {dw_cols}")
+            else:
+                print("[build_backtest_data] dw 权重为空 (数据不足 IC 窗口期)")
+        except Exception as e:
+            import traceback
+            print(f"[build_backtest_data] dw 权重计算失败: {e}\n{traceback.format_exc()}")
 
         return data
 
@@ -2244,7 +2259,14 @@ class MainWindow(QMainWindow):
         # 缓存：策略/代码/日期范围不变时复用已构建数据
         cache_key = f"{','.join(sorted(codes))}|{start_date}|{end_date}"
         if self._bt_data_cache_key == cache_key and self._bt_data_cache is not None:
-            data = self._bt_data_cache.copy()
+            # 验证缓存包含 _z_* 列（防止代码热更新后用到旧缓存）
+            cached = self._bt_data_cache
+            has_z = any(c.startswith("_z_") for c in cached.columns)
+            if has_z:
+                data = cached.copy()
+            else:
+                print("[run_backtest] 缓存缺少 _z_* 列, 强制重建")
+                data = self.build_backtest_data(codes, start=start_date, end=end_date)
         else:
             data = self.build_backtest_data(codes, start=start_date, end=end_date)
             if not data.empty:
@@ -2277,14 +2299,15 @@ class MainWindow(QMainWindow):
         self.run_backtest_btn.setEnabled(False)
         self.run_backtest_btn.setText("计算中...")
 
+        self._bt_stg = stg
         worker = BacktestWorker(
             self.bt,
             stg,
             data,
             benchmark=bench_df,
             base_point=1000.0,
-            commission_bps=float(self.comm_spin.value()),
-            slippage_bps=float(self.slip_spin.value()),
+            commission_bps=1.0,
+            slippage_bps=2.0,
         )
         worker.signals.log.connect(self._on_bt_log, Qt.QueuedConnection)
         worker.signals.finished.connect(self._on_bt_finished, Qt.QueuedConnection)
@@ -2338,8 +2361,25 @@ class MainWindow(QMainWindow):
                     f"收益 {r['pnl_pct'] * 100:.2f}%"
                 )
 
+        # 过滤链统计
+        fc = result.get("filter_chain", {})
+        if fc:
+            lines = [
+                f"--- 过滤链统计 ---",
+                f"总候选: {fc.get('total_want', 0)}",
+                f"停牌/缺价: {fc.get('halted', 0)} ({fc.get('halted_pct', 0):.1%})",
+                f"流动性冻结: {fc.get('liquidity_frozen', 0)}",
+                f"相关性过滤: {fc.get('corr_filtered', 0)}",
+                f"暴露为0天数: {fc.get('exposure_zero', 0)} ({fc.get('exposure_zero_pct', 0):.1%})",
+                f"暴露<1天数: {fc.get('exposure_partial', 0)} ({fc.get('exposure_partial_pct', 0):.1%})",
+            ]
+            self.backtest_log.append("\n".join(lines))
+
         # 策略解释器
-        self._explain_last_day(data, stg)
+        data = self._bt_data_cache
+        stg = self._bt_stg
+        if data is not None and not data.empty and stg:
+            self._explain_last_day(data, stg)
 
     def _explain_last_day(self, data: pd.DataFrame, stg: dict):
         """解释最后一日的持仓选择：用策略真实分组定义，精确分解 Top-5 ETF 得分"""
@@ -2394,7 +2434,7 @@ class MainWindow(QMainWindow):
             if "breadth" in last_df.columns:
                 lines.append(f"breadth: {float(last_df['breadth'].iloc[0]):.3f}")
 
-            lines.append(f"\nTop-5 ETF 分解得分（真实分组 rank 均值）:")
+            lines.append(f"\nTop-5 ETF 分解得分（分组 zscore 均值）:")
             top5 = last_df.head(5)
             for _, row in top5.iterrows():
                 code = str(row["code"])
@@ -2410,18 +2450,24 @@ class MainWindow(QMainWindow):
 
                     transform = cat_def.get("transform", "")
                     if transform == "beta_penalty":
-                        # Bear 中 structure：用 -abs(beta-1) 代替 barra_beta
-                        group_ranks = []
+                        group_zs = []
                         for f in avail:
                             if f == "barra_beta":
-                                penalty = -abs(last_df["barra_beta"] - 1.0)
-                                group_ranks.append(penalty.rank(pct=True))
+                                dev = -abs(last_df["barra_beta"] - 1.0)
+                                z = (dev - dev.mean()) / (dev.std() if dev.std() != 0 else 1)
+                                group_zs.append(z)
                             else:
-                                group_ranks.append(last_df[f].rank(pct=True))
-                        cat_val = float(np.mean([r.loc[row.name] for r in group_ranks]))
+                                s = last_df[f]
+                                group_zs.append((s - s.mean()) / (s.std() if s.std() != 0 else 1))
+                        cat_vals = [float(z.loc[row.name]) for z in group_zs]
+                        cat_val = float(np.nanmean(cat_vals)) if cat_vals else float('nan')
                     else:
-                        ranks = [last_df[f].rank(pct=True) for f in avail]
-                        cat_val = float(np.mean([r.loc[row.name] for r in ranks]))
+                        zs = []
+                        for f in avail:
+                            s = last_df[f]
+                            zs.append((s - s.mean()) / (s.std() if s.std() != 0 else 1))
+                        cat_vals = [float(z.loc[row.name]) for z in zs]
+                        cat_val = float(np.nanmean(cat_vals)) if cat_vals else float('nan')
 
                     lines.append(f"    {cat_name}_score: {cat_val:.4f}")
 

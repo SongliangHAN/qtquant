@@ -15,11 +15,12 @@ class OptimizerSignals(QObject):
 
 
 class OptimizerWorker(QRunnable):
-    def __init__(self, optimize_fn, *, build_data_fn, build_strategy_fn, space: dict, config: dict):
+    def __init__(self, optimize_fn, *, build_data_fn=None, data=None, build_strategy_fn, space: dict, config: dict):
         super().__init__()
         self.signals = OptimizerSignals()
         self.optimize_fn = optimize_fn
         self.build_data_fn = build_data_fn
+        self._data = data
         self.build_strategy_fn = build_strategy_fn
         self.space = space
         self.config = config
@@ -32,11 +33,16 @@ class OptimizerWorker(QRunnable):
     def run(self):
         t_start = time.monotonic()
         try:
-            self.signals.phase.emit("数据准备")
-            self.signals.log.emit("开始构建数据...")
-            self.signals.log.emit("加载研究 parquet 文件...")
-
-            data = self.build_data_fn()
+            if self._data is not None:
+                data = self._data
+                self.signals.phase.emit("数据准备")
+                n_symbols = data["code"].nunique() if "code" in data.columns else "?"
+                self.signals.log.emit(f"数据准备完成：{len(data)} 行，{n_symbols} 只ETF，开始搜索...")
+            else:
+                self.signals.phase.emit("数据准备")
+                self.signals.log.emit("开始构建数据...")
+                self.signals.log.emit("加载研究 parquet 文件...")
+                data = self.build_data_fn()
 
             if self._cancel_event.is_set():
                 self.signals.cancelled.emit({"best_score": 0.0, "best_params": {}, "detail": []})
