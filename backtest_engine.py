@@ -339,7 +339,6 @@ class BacktestEngine:
         # 交易成本
         commission = commission_bps / 10000.0
         base_slippage = slippage_bps / 10000.0
-        impact_k = float(pos_rule.get("impact_k", 0.001))
 
         def _dynamic_slippage(code, day_df, notional=0.0):
             """
@@ -368,6 +367,7 @@ class BacktestEngine:
         buy_rule = strategy.get("buy_rule", {}) or {}
         sell_rule = strategy.get("sell_rule", {}) or {}
         pos_rule = strategy.get("position", {}) or {}
+        impact_k = float(pos_rule.get("impact_k", 0.001))
 
         max_positions = int(pos_rule.get("max_positions", buy_rule.get("top_n", 1)) or 1)
         min_hold_days = max(1, int(strategy.get("execution", {}).get("min_hold_days", 1) or 1))

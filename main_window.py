@@ -27,6 +27,62 @@ from market_regime import MarketRegimeDetector
 from factor_lab import FactorLab
 
 
+# ── Factor Lab 后台线程 ──
+
+class FactorLabSignals(QObject):
+    finished = Signal(dict)  # {"ic", "decay", "quantile", "corr", "regime", ...}
+    failed = Signal(str)
+
+
+class FactorLabWorker(QRunnable):
+    """后台执行因子研究计算，避免界面卡死。"""
+
+    def __init__(self, codes: list[str], research, selected: list[str],
+                 horizon: int, window: int, n_quantiles: int):
+        super().__init__()
+        self.signals = FactorLabSignals()
+        self.codes = codes
+        self.research = research
+        self.selected = selected
+        self.horizon = horizon
+        self.window = window
+        self.n_quantiles = n_quantiles
+
+    def run(self):
+        try:
+            data = self.research.load_many(self.codes, start="2015-01-01")
+            if data.empty:
+                self.signals.failed.emit("没有可用的研究数据")
+                return
+
+            lab = FactorLab(data)
+            results = {}
+
+            results["ic"] = lab.compute_rolling_ic(
+                factors=self.selected, horizon=self.horizon, window=self.window)
+
+            results["decay"] = lab.compute_ic_decay(
+                factors=self.selected, horizons=[1, 5, 10, 20])
+
+            if self.selected:
+                results["quantile"] = lab.compute_quantile_returns(
+                    factor=self.selected[0], horizon=self.horizon,
+                    n_quantiles=self.n_quantiles)
+            else:
+                results["quantile"] = pd.DataFrame()
+
+            results["corr"] = lab.compute_factor_correlation(factors=self.selected)
+
+            results["regime"] = lab.compute_regime_ic(
+                factors=self.selected, horizon=self.horizon)
+
+            self.signals.finished.emit(results)
+
+        except Exception:
+            import traceback
+            self.signals.failed.emit(traceback.format_exc())
+
+
 # ==========================================
 # 指标 / 因子说明
 # ==========================================
