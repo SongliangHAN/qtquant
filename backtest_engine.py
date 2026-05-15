@@ -80,7 +80,7 @@ class BacktestEngine:
 
         corr = returns_df.corr().values
         # 距离矩阵
-        dist = np.sqrt(0.5 * (1.0 - corr))
+        dist = np.sqrt(0.5 * np.clip(1.0 - corr, 0, None))
         # 确保对称且对角线为0
         dist = (dist + dist.T) / 2.0
         np.fill_diagonal(dist, 0.0)
@@ -884,7 +884,7 @@ class BacktestEngine:
             return {}
 
         nav = equity_df["nav"].astype(float)
-        ret = nav.pct_change().fillna(0.0)
+        ret = nav.pct_change(fill_method=None).fillna(0.0)
 
         total_return = nav.iloc[-1] / nav.iloc[0] - 1
         ann_return = (1 + total_return) ** (252 / max(1, len(nav) - 1)) - 1

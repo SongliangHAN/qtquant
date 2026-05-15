@@ -27,23 +27,25 @@ from market_regime import MarketRegimeDetector
 from factor_lab import FactorLab
 
 
-# ── Factor Lab 后台线程 ──
+# ── Factor Research 后台线程 ──
 
-class FactorLabSignals(QObject):
-    finished = Signal(dict)  # {"ic", "decay", "quantile", "corr", "regime", ...}
+class FactorResearchSignals(QObject):
+    finished = Signal(dict)
     failed = Signal(str)
+    stage = Signal(str)
+    progress = Signal(int, int, str)
 
 
-class FactorLabWorker(QRunnable):
-    """后台执行因子研究计算，避免界面卡死。"""
+class FactorResearchWorker(QRunnable):
+    """后台执行全量因子研究计算，emit stage/progress 信号供 UI 显示进度。"""
 
-    def __init__(self, codes: list[str], research, selected: list[str],
-                 horizon: int, window: int, n_quantiles: int):
+    def __init__(self, codes: list[str], research, registry: dict,
+                 horizon: int = 5, window: int = 60, n_quantiles: int = 5):
         super().__init__()
-        self.signals = FactorLabSignals()
+        self.signals = FactorResearchSignals()
         self.codes = codes
         self.research = research
-        self.selected = selected
+        self.registry = registry
         self.horizon = horizon
         self.window = window
         self.n_quantiles = n_quantiles
@@ -55,26 +57,19 @@ class FactorLabWorker(QRunnable):
                 self.signals.failed.emit("没有可用的研究数据")
                 return
 
-            lab = FactorLab(data)
-            results = {}
+            from factor_research_engine import FactorResearchEngine
+            engine = FactorResearchEngine(data)
 
-            results["ic"] = lab.compute_rolling_ic(
-                factors=self.selected, horizon=self.horizon, window=self.window)
+            def progress_cb(cur, total, msg):
+                self.signals.stage.emit(msg)
+                self.signals.progress.emit(cur, total, msg)
 
-            results["decay"] = lab.compute_ic_decay(
-                factors=self.selected, horizons=[1, 5, 10, 20])
-
-            if self.selected:
-                results["quantile"] = lab.compute_quantile_returns(
-                    factor=self.selected[0], horizon=self.horizon,
-                    n_quantiles=self.n_quantiles)
-            else:
-                results["quantile"] = pd.DataFrame()
-
-            results["corr"] = lab.compute_factor_correlation(factors=self.selected)
-
-            results["regime"] = lab.compute_regime_ic(
-                factors=self.selected, horizon=self.horizon)
+            results = engine.run_full_research(
+                horizon=self.horizon,
+                window=self.window,
+                n_quantiles=self.n_quantiles,
+                progress_cb=progress_cb,
+            )
 
             self.signals.finished.emit(results)
 
@@ -402,38 +397,31 @@ FACTOR_EXPLAIN = {
 # 因子正交分类系统
 # 每类因子经济含义不同，优化器按类别约束搜索，避免同质因子重复加杠杆
 # ==========================================
-FACTOR_GROUPS = {
-    "trend": {      # 趋势/动量
-        "name": "趋势",
-        "factors": ["roc20", "roc60", "breakout20", "relative_strength_vs_hs300"],
-        "sign": +1,  # 牛市正向、熊市惩罚
-    },
-    "risk": {       # 波动/回撤（通常为惩罚项）
-        "name": "风险",
-        "factors": ["volatility20", "downside_volatility", "max_drawdown20", "atr20"],
-        "sign": -1,
-    },
-    "volume": {     # 资金/成交量
-        "name": "资金",
-        "factors": ["turnover_change", "vol_ratio20"],
-        "sign": +1,
-    },
-    "structure": {  # 结构/相关性
-        "name": "结构",
-        "factors": ["barra_beta", "corr_hs300_60"],
-        "sign": None,  # 牛市偏好高beta；熊市偏好beta≈1
-    },
-    "consistency": {  # 趋势一致性
-        "name": "一致性",
-        "factors": ["trend_consistency"],
-        "sign": +1,
-    },
-    "mean_reversion": {  # 均值回复（震荡市专用）
-        "name": "均值回复",
-        "factors": ["ma_distance"],
-        "sign": None,  # 震荡市偏好负偏离（超跌反弹）
-    },
-}
+from factor_registry import (
+    FACTOR_REGISTRY, FACTOR_GROUPS as _FACTOR_GROUP_DEFS,
+    get_active_factors_for_strategy, get_factor_info, get_factor_groups,
+)
+
+# 构建策略优化器使用的因子组结构
+FACTOR_GROUPS = {}
+_active = get_active_factors_for_strategy()
+for g, gdef in _FACTOR_GROUP_DEFS.items():
+    if g == "auxiliary":
+        continue
+    factors = _active.get(g, [k for k, v in FACTOR_REGISTRY.items() if v.get("group") == g])
+    FACTOR_GROUPS[g] = {
+        "name": gdef["name"],
+        "factors": factors,
+        "sign": gdef.get("sign_default"),
+    }
+
+
+def _fallback_explain_groups() -> dict:
+    """旧策略无 explain_groups 时的默认分组定义（从 registry 读取）。"""
+    groups = {}
+    for g, gdef in FACTOR_GROUPS.items():
+        groups[g] = {"factors": gdef["factors"]}
+    return groups
 
 
 class MainWindow(QMainWindow):
@@ -564,187 +552,435 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
 
-        title = QLabel("因子研究 — 滚动RankIC · IC衰减 · 分位数收益 · 相关性 · 状态IC")
+        title = QLabel("因子研究 — 全量因子分析 · Summary · Detail · Correlation · Approval")
         title.setStyleSheet("font-size:20px;font-weight:bold;")
         layout.addWidget(title)
 
         # ── 控制栏 ──
         ctrl = QHBoxLayout()
 
-        ctrl.addWidget(QLabel("因子："))
-        self.fl_factor_checks = {}
-        from factor_monitor import GROUP_REPRESENTATIVES
-        for group, rep in GROUP_REPRESENTATIVES.items():
-            cb = QCheckBox(f"{group}({rep})")
-            cb.setChecked(True)
-            self.fl_factor_checks[rep] = cb
-            ctrl.addWidget(cb)
+        self.fl_run_btn = QPushButton("运行全量研究")
+        self.fl_run_btn.clicked.connect(self._on_fl_compute)
+        ctrl.addWidget(self.fl_run_btn)
+
+        self.fl_cache_btn = QPushButton("从缓存加载")
+        self.fl_cache_btn.clicked.connect(self._on_fl_load_cache)
+        ctrl.addWidget(self.fl_cache_btn)
 
         ctrl.addSpacing(16)
-        ctrl.addWidget(QLabel("IC前瞻期："))
+        ctrl.addWidget(QLabel("Horizon:"))
         self.fl_horizon = QSpinBox()
         self.fl_horizon.setRange(1, 60)
         self.fl_horizon.setValue(5)
         ctrl.addWidget(self.fl_horizon)
 
-        ctrl.addWidget(QLabel("滚动窗口："))
+        ctrl.addWidget(QLabel("Window:"))
         self.fl_window = QSpinBox()
         self.fl_window.setRange(20, 252)
         self.fl_window.setValue(60)
         ctrl.addWidget(self.fl_window)
 
-        ctrl.addWidget(QLabel("分位数："))
+        ctrl.addWidget(QLabel("Quantiles:"))
         self.fl_n_quantiles = QSpinBox()
         self.fl_n_quantiles.setRange(3, 10)
         self.fl_n_quantiles.setValue(5)
         ctrl.addWidget(self.fl_n_quantiles)
 
-        self.fl_compute_btn = QPushButton("开始计算")
-        self.fl_compute_btn.clicked.connect(self._on_fl_compute)
-        ctrl.addWidget(self.fl_compute_btn)
-
         ctrl.addStretch()
         layout.addLayout(ctrl)
 
-        # ── 图表子选项卡 ──
-        self.fl_chart_tabs = QTabWidget()
-        layout.addWidget(self.fl_chart_tabs, stretch=1)
+        # ── 进度条 ──
+        self.fl_stage_label = QLabel("就绪")
+        self.fl_progress = QProgressBar()
+        self.fl_progress.setMaximum(100)
+        prog_layout = QHBoxLayout()
+        prog_layout.addWidget(self.fl_stage_label)
+        prog_layout.addWidget(self.fl_progress)
+        layout.addLayout(prog_layout)
 
-        # Rolling IC
-        self.fl_ic_plot = pg.PlotWidget(title="Rolling RankIC")
-        self.fl_ic_plot.setLabel("left", "|IC|")
-        self.fl_ic_plot.setLabel("bottom", "日期")
-        self.fl_ic_plot.addLegend()
-        self.fl_ic_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.fl_chart_tabs.addTab(self.fl_ic_plot, "Rolling IC")
+        # ── 子Tab ──
+        self.fl_main_tabs = QTabWidget()
+        layout.addWidget(self.fl_main_tabs, stretch=1)
 
-        # IC Decay
-        self.fl_decay_plot = pg.PlotWidget(title="IC Decay")
-        self.fl_decay_plot.setLabel("left", "Mean |IC|")
-        self.fl_decay_plot.setLabel("bottom", "Horizon (d)")
-        self.fl_decay_plot.addLegend()
-        self.fl_decay_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.fl_chart_tabs.addTab(self.fl_decay_plot, "IC Decay")
-
-        # Quantile Return
-        self.fl_quantile_plot = pg.PlotWidget(title="Quantile Forward Returns")
-        self.fl_quantile_plot.setLabel("left", "Mean Fwd Return")
-        self.fl_quantile_plot.setLabel("bottom", "日期")
-        self.fl_quantile_plot.addLegend()
-        self.fl_quantile_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.fl_chart_tabs.addTab(self.fl_quantile_plot, "分位数收益")
-
-        # Factor Correlation Heatmap
-        self.fl_corr_plot = pg.PlotWidget(title="因子截面相关性矩阵")
-        self.fl_corr_plot.setLabel("left", "")
-        self.fl_corr_plot.setLabel("bottom", "")
-        self.fl_chart_tabs.addTab(self.fl_corr_plot, "因子相关性")
-
-        # Regime IC
-        self.fl_regime_plot = pg.PlotWidget(title="Regime IC")
-        self.fl_regime_plot.setLabel("left", "Mean |IC|")
-        self.fl_regime_plot.setLabel("bottom", "Regime")
-        self.fl_regime_plot.addLegend()
-        self.fl_regime_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.fl_chart_tabs.addTab(self.fl_regime_plot, "Regime IC")
-
-        # ── 汇总表格 ──
-        self.fl_summary_table = QTableWidget()
-        self.fl_summary_table.setMinimumHeight(120)
-        layout.addWidget(self.fl_summary_table)
+        # Tab 1: Summary Report
+        self._build_summary_tab()
+        # Tab 2: Factor Detail
+        self._build_detail_tab()
+        # Tab 3: Correlation Map
+        self._build_correlation_tab()
+        # Tab 4: Approval
+        self._build_approval_tab()
 
         return page
 
-    def _on_fl_compute(self):
-        """后台执行因子研究计算（不阻塞UI）。"""
-        selected = [f for f, cb in self.fl_factor_checks.items() if cb.isChecked()]
-        if not selected:
-            QMessageBox.warning(self, "提示", "请至少选择一个因子")
-            return
+    # ═════════════════════════════════════════════════════════════════
+    # 子Tab构建
+    # ═════════════════════════════════════════════════════════════════
 
+    def _build_summary_tab(self):
+        w = QWidget()
+        l = QVBoxLayout(w)
+        self.fl_summary_table = QTableView()
+        self.fl_summary_table.setSortingEnabled(True)
+        self.fl_summary_table.setAlternatingRowColors(True)
+        self.fl_summary_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.fl_summary_table.doubleClicked.connect(self._on_summary_double_click)
+        l.addWidget(self.fl_summary_table)
+        self.fl_main_tabs.addTab(w, "Summary")
+
+    def _build_detail_tab(self):
+        w = QWidget()
+        l = QHBoxLayout(w)
+
+        # 左侧因子列表
+        left = QVBoxLayout()
+        left.addWidget(QLabel("因子列表:"))
+        self.fl_detail_list = QListWidget()
+        self.fl_detail_list.currentTextChanged.connect(self._on_detail_factor_changed)
+        left.addWidget(self.fl_detail_list)
+        l.addLayout(left, stretch=1)
+
+        # 右侧图表区
+        right = QVBoxLayout()
+        self.fl_detail_charts = QTabWidget()
+        self.fl_detail_charts.addTab(self._make_plot("Rolling IC", "|IC|", "日期"), "Rolling IC")
+        self.fl_detail_charts.addTab(self._make_plot("Quantile Return", "Mean Return", "日期"), "Quantile Return")
+        self.fl_detail_charts.addTab(self._make_plot("IC Decay", "|IC|", "Horizon (d)"), "IC Decay")
+        self.fl_detail_charts.addTab(self._make_plot("Regime IC", "|IC|", ""), "Regime IC")
+        right.addWidget(self.fl_detail_charts, stretch=3)
+        l.addLayout(right, stretch=3)
+
+        self.fl_main_tabs.addTab(w, "详情")
+
+    @staticmethod
+    def _make_plot(title, left, bottom):
+        p = pg.PlotWidget(title=title)
+        p.setLabel("left", left)
+        p.setLabel("bottom", bottom)
+        p.addLegend()
+        p.showGrid(x=True, y=True, alpha=0.3)
+        return p
+
+    def _build_correlation_tab(self):
+        w = QWidget()
+        l = QVBoxLayout(w)
+
+        subtabs = QTabWidget()
+
+        # 热力图
+        self.fl_corr_plot = pg.PlotWidget(title="因子相关性热力图")
+        subtabs.addTab(self.fl_corr_plot, "热力图")
+
+        # 高相关对表格
+        self.fl_corr_pairs_table = QTableWidget()
+        self.fl_corr_pairs_table.setColumnCount(3)
+        self.fl_corr_pairs_table.setHorizontalHeaderLabels(["因子A", "因子B", "|相关性|"])
+        subtabs.addTab(self.fl_corr_pairs_table, "高相关对")
+
+        l.addWidget(subtabs)
+        self.fl_main_tabs.addTab(w, "相关性")
+
+    def _build_approval_tab(self):
+        w = QWidget()
+        l = QHBoxLayout(w)
+
+        # 左侧：因子树
+        left = QVBoxLayout()
+        left.addWidget(QLabel("因子审批 (☑ = 启用):"))
+        self.fl_approval_tree = QTreeWidget()
+        self.fl_approval_tree.setHeaderLabels(["因子组 / 因子", "状态"])
+        self.fl_approval_tree.setColumnWidth(0, 220)
+        left.addWidget(self.fl_approval_tree)
+        l.addLayout(left, stretch=1)
+
+        # 右侧：Regime映射 + 按钮
+        right = QVBoxLayout()
+        right.addWidget(QLabel("Regime 因子组映射:"))
+        self.fl_regime_map_table = QTableWidget()
+        regimes_list = ["bull", "bull_volatile", "bear", "panic", "sideways"]
+        groups_list = [g for g in get_factor_groups() if g != "auxiliary"]
+        self.fl_regime_map_table.setRowCount(len(regimes_list))
+        self.fl_regime_map_table.setColumnCount(len(groups_list) + 1)
+        self.fl_regime_map_table.setHorizontalHeaderLabels(["Regime"] + groups_list)
+        for i, r in enumerate(regimes_list):
+            self.fl_regime_map_table.setItem(i, 0, QTableWidgetItem(r))
+        right.addWidget(self.fl_regime_map_table)
+
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("保存审批配置")
+        save_btn.clicked.connect(self._on_approval_save)
+        btn_layout.addWidget(save_btn)
+        load_btn = QPushButton("加载审批配置")
+        load_btn.clicked.connect(self._on_approval_load)
+        btn_layout.addWidget(load_btn)
+        reset_btn = QPushButton("重置为默认")
+        reset_btn.clicked.connect(self._on_approval_reset)
+        btn_layout.addWidget(reset_btn)
+        right.addLayout(btn_layout)
+        l.addLayout(right, stretch=2)
+
+        self.fl_main_tabs.addTab(w, "审批")
+
+    # ═════════════════════════════════════════════════════════════════
+    # 交互逻辑
+    # ═════════════════════════════════════════════════════════════════
+
+    def _on_fl_compute(self):
         codes = [x["code"] for x in self.ds.get_all_etf()]
         horizon = self.fl_horizon.value()
         window = self.fl_window.value()
         n_q = self.fl_n_quantiles.value()
-        self.fl_compute_btn.setEnabled(False)
-        self.fl_compute_btn.setText("计算中...")
+        self.fl_run_btn.setEnabled(False)
+        self.fl_run_btn.setText("计算中...")
+        self.fl_cache_btn.setEnabled(False)
 
-        self._fl_selected = selected
-        self._fl_horizon = horizon
-        self._fl_n_q = n_q
-
-        worker = FactorLabWorker(
-            codes=codes, research=self.research,
-            selected=selected, horizon=horizon,
-            window=window, n_quantiles=n_q)
+        worker = FactorResearchWorker(
+            codes=codes, research=self.research, registry=FACTOR_REGISTRY,
+            horizon=horizon, window=window, n_quantiles=n_q,
+        )
+        worker.signals.stage.connect(self._on_fl_stage, Qt.QueuedConnection)
+        worker.signals.progress.connect(self._on_fl_progress, Qt.QueuedConnection)
         worker.signals.finished.connect(self._on_fl_finished, Qt.QueuedConnection)
         worker.signals.failed.connect(self._on_fl_failed, Qt.QueuedConnection)
         self._fl_worker = worker
         QThreadPool.globalInstance().start(worker)
 
+    def _on_fl_load_cache(self):
+        from factor_cache import FactorCache
+        codes = [x["code"] for x in self.ds.get_all_etf()]
+        cache = FactorCache()
+        report = cache.load_metrics()
+        if report is None or report.empty:
+            QMessageBox.information(self, "缓存", "没有找到缓存的研究结果，请先运行全量研究。")
+            return
+        self._fl_report = report
+        self._load_cached_details(cache)
+        self._populate_summary_table(report)
+        self._populate_detail_list(report)
+        self._populate_correlation_from_report(report)
+        self._populate_approval_from_registry()
+        self.fl_stage_label.setText("已从缓存加载")
+
+    def _load_cached_details(self, cache):
+        self._fl_cached = {}
+        for name in ["rolling_ic", "ic_decay", "corr_matrix", "regime_ic", "turnover"]:
+            df = cache.load_cached(name)
+            if df is not None:
+                self._fl_cached[name] = df
+
+    def _on_fl_stage(self, msg: str):
+        self.fl_stage_label.setText(msg)
+
+    def _on_fl_progress(self, cur: int, total: int, msg: str):
+        self.fl_progress.setMaximum(total)
+        self.fl_progress.setValue(cur)
+        self.fl_stage_label.setText(msg)
+
     def _on_fl_failed(self, msg: str):
-        self.fl_compute_btn.setEnabled(True)
-        self.fl_compute_btn.setText("开始计算")
+        self.fl_run_btn.setEnabled(True)
+        self.fl_run_btn.setText("运行全量研究")
+        self.fl_cache_btn.setEnabled(True)
         QMessageBox.warning(self, "因子研究错误", msg)
 
     def _on_fl_finished(self, results: dict):
-        ic_df = results.get("ic", pd.DataFrame())
-        decay_df = results.get("decay", pd.DataFrame())
-        q_df = results.get("quantile", pd.DataFrame())
-        corr_df = results.get("corr", pd.DataFrame())
-        regime_df = results.get("regime", pd.DataFrame())
+        report = results.get("report", pd.DataFrame())
+        rolling_ic = results.get("rolling_ic", pd.DataFrame())
+        ic_decay = results.get("ic_decay", pd.DataFrame())
+        corr_matrix = results.get("corr_matrix", pd.DataFrame())
+        regime_ic = results.get("regime_ic", pd.DataFrame())
+        turnover = results.get("turnover", pd.Series())
+        clusters = results.get("clusters", {})
+        stability = results.get("stability", pd.Series())
+        monotonicity = results.get("monotonicity", pd.Series())
 
-        selected = self._fl_selected
-        horizon = self._fl_horizon
-        n_q = self._fl_n_q
+        # 缓存
+        from factor_cache import FactorCache
+        codes = [x["code"] for x in self.ds.get_all_etf()]
+        cache = FactorCache()
+        cache.save_metrics(report)
+        if not rolling_ic.empty:
+            cache.save_cached("rolling_ic", rolling_ic)
+        if not ic_decay.empty:
+            cache.save_cached("ic_decay", ic_decay)
+        if not corr_matrix.empty:
+            cache.save_cached("corr_matrix", corr_matrix)
+        if not regime_ic.empty:
+            cache.save_cached("regime_ic", regime_ic)
+        if turnover is not None and len(turnover) > 0:
+            cache.save_cached("turnover", turnover.to_frame("turnover"))
+        cache.mark_valid(codes, "2015-01-01", "today",
+                         [f for f in cache.cached_file_names()])
 
-        # ── Rolling IC ──
-        self.fl_ic_plot.clear()
-        self.fl_ic_plot.addLegend()
-        if not ic_df.empty:
-            colors = ["#40c4ff", "#ffd54f", "#00e676", "#ff4081", "#ffab40"]
-            for idx, col in enumerate([c for c in ic_df.columns if c != "date"]):
-                y = ic_df[col].values
-                x = ic_df["date"].values.astype("datetime64[s]").astype(int)
-                pen = pg.mkPen(color=colors[idx % len(colors)], width=1.5)
-                self.fl_ic_plot.plot(x, y, pen=pen, name=col.replace("ic_", ""))
+        self._fl_report = report
+        self._fl_cached = {
+            "rolling_ic": rolling_ic, "ic_decay": ic_decay,
+            "corr_matrix": corr_matrix, "regime_ic": regime_ic,
+            "turnover": turnover,
+        }
 
-        # ── IC Decay ──
-        self.fl_decay_plot.clear()
-        self.fl_decay_plot.addLegend()
-        if not decay_df.empty:
-            colors = ["#40c4ff", "#ffd54f", "#00e676", "#ff4081", "#ffab40"]
-            for idx, row in decay_df.iterrows():
-                factor = row["factor"]
-                x = [1, 5, 10, 20]
-                y = [row.get(f"h{h}", np.nan) for h in x]
-                pen = pg.mkPen(color=colors[idx % len(colors)], width=2)
-                sym = pg.ScatterPlotItem(x=x, y=y, pen=pen, brush=colors[idx % len(colors)],
-                                          size=10, name=factor)
-                self.fl_decay_plot.addItem(sym)
-                self.fl_decay_plot.plot(x, y, pen=pen)
+        # 填充UI
+        self._populate_summary_table(report)
+        self._populate_detail_list(report)
+        self._populate_correlation_from_report(report)
+        self._populate_approval_from_registry()
 
-        # ── Quantile Return ──
-        if selected and not q_df.empty:
-            self.fl_quantile_plot.clear()
-            self.fl_quantile_plot.addLegend()
+        self.fl_run_btn.setEnabled(True)
+        self.fl_run_btn.setText("运行全量研究")
+        self.fl_cache_btn.setEnabled(True)
+        self.fl_progress.setValue(self.fl_progress.maximum())
+        self.fl_stage_label.setText(f"完成 — {len(report)} 个因子已研究")
+
+    # ── Summary 表格 ──
+
+    def _populate_summary_table(self, report: pd.DataFrame):
+        if report is None or report.empty:
+            return
+        display_cols = [
+            "factor", "group", "mean_ic", "icir", "bull_ic", "bear_ic",
+            "sideways_ic", "turnover", "monotonicity", "coverage_pct", "corr_cluster",
+        ]
+        available = [c for c in display_cols if c in report.columns]
+        model = QStandardItemModel(len(report), len(available))
+        model.setHorizontalHeaderLabels(available)
+        for i, row in report.iterrows():
+            for j, col in enumerate(available):
+                val = row.get(col, np.nan)
+                item = QStandardItem()
+                if isinstance(val, float):
+                    item.setData(float(val), Qt.DisplayRole)
+                    item.setText(f"{val:.4f}")
+                elif val is None or (isinstance(val, float) and np.isnan(val)):
+                    item.setText("N/A")
+                else:
+                    item.setText(str(val))
+                item.setEditable(False)
+                model.setItem(i, j, item)
+        self.fl_summary_table.setModel(model)
+        self.fl_summary_table.resizeColumnsToContents()
+
+    def _on_summary_double_click(self, index):
+        model = self.fl_summary_table.model()
+        if not model:
+            return
+        factor = model.item(index.row(), 0).text()
+        items = self.fl_detail_list.findItems(factor, Qt.MatchExactly)
+        if items:
+            self.fl_detail_list.setCurrentItem(items[0])
+            self.fl_main_tabs.setCurrentIndex(1)  # 切换到 Detail tab
+
+    # ── Detail 标签 ──
+
+    def _populate_detail_list(self, report: pd.DataFrame):
+        self.fl_detail_list.clear()
+        if report is not None and not report.empty:
+            for _, row in report.iterrows():
+                f_name = row.get("factor", "")
+                g_name = row.get("group", "")
+                ic_val = row.get("mean_ic", np.nan)
+                label = f"{f_name} [{g_name}] ic={ic_val:.4f}" if not np.isnan(ic_val) else f"{f_name} [{g_name}]"
+                self.fl_detail_list.addItem(label)
+
+    def _on_detail_factor_changed(self, text: str):
+        if not text:
+            return
+        factor = text.split(" [")[0]
+        self._render_detail_factor(factor)
+
+    def _render_detail_factor(self, factor: str):
+        report = getattr(self, "_fl_report", None)
+        cached = getattr(self, "_fl_cached", {})
+        if report is None:
+            return
+
+        # Rolling IC
+        ic_plot = self.fl_detail_charts.widget(0)
+        ic_plot.clear()
+        ic_plot.addLegend()
+        rolling_ic = cached.get("rolling_ic")
+        if rolling_ic is not None and not rolling_ic.empty:
+            ic_col = f"ic_{factor}"
+            if ic_col in rolling_ic.columns:
+                y = rolling_ic[ic_col].dropna().values
+                x = rolling_ic["date"].values[:len(y)]
+                try:
+                    x_num = x.astype("datetime64[s]").astype(int)
+                    ic_plot.plot(x_num, y, pen=pg.mkPen(color="#40c4ff", width=2), name=factor)
+                except Exception:
+                    pass
+
+        # Quantile Return
+        q_plot = self.fl_detail_charts.widget(1)
+        q_plot.clear()
+        q_plot.addLegend()
+        # Quantile returns for this factor (use FactorLab directly if not cached)
+        # For simplicity: on-demand compute via the engine
+        if hasattr(self, "_fl_q_cache"):
+            qdf = self._fl_q_cache.get(factor)
+        else:
+            qdf = None
+        if qdf is not None and not qdf.empty:
             cmap = ["#2d8cf0", "#40c4ff", "#69f0ae", "#ffd54f", "#ff4081"]
-            for idx, col in enumerate(sorted(q_df.columns)):
-                if col.startswith("q"):
-                    y = q_df[col].values
-                    x = q_df.index.values.astype("datetime64[s]").astype(int)
-                    pen = pg.mkPen(color=cmap[idx % len(cmap)], width=1.5)
-                    self.fl_quantile_plot.plot(x, y, pen=pen, name=f"{selected[0]} {col}")
+            for idx, col in enumerate(sorted(qdf.columns)):
+                y = qdf[col].values
+                x = qdf.index.values.astype("datetime64[s]").astype(int)
+                q_plot.plot(x, y, pen=pg.mkPen(color=cmap[idx % len(cmap)], width=1.5),
+                           name=col)
 
-        # ── Factor Correlation ──
+        # IC Decay
+        decay_plot = self.fl_detail_charts.widget(2)
+        decay_plot.clear()
+        decay_plot.addLegend()
+        ic_decay = cached.get("ic_decay")
+        if ic_decay is not None and not ic_decay.empty:
+            dr = ic_decay[ic_decay["factor"] == factor]
+            if len(dr) > 0:
+                dr = dr.iloc[0]
+                h_vals = [dr.get(f"h{h}", np.nan) for h in [1, 5, 10, 20]]
+                x = [1, 5, 10, 20]
+                valid = [(xi, yi) for xi, yi in zip(x, h_vals) if not np.isnan(yi)]
+                if valid:
+                    xs, ys = zip(*valid)
+                    scatter = pg.ScatterPlotItem(x=xs, y=ys, pen=pg.mkPen(color="#ff4081", width=2),
+                                                  brush="#ff4081", size=10, name=factor)
+                    decay_plot.addItem(scatter)
+                    decay_plot.plot(list(xs), list(ys), pen=pg.mkPen(color="#ff4081", width=2))
+
+        # Regime IC
+        regime_plot = self.fl_detail_charts.widget(3)
+        regime_plot.clear()
+        regime_plot.addLegend()
+        regime_ic = cached.get("regime_ic")
+        if regime_ic is not None and not regime_ic.empty:
+            rr = regime_ic[regime_ic["factor"] == factor]
+            if len(rr) > 0:
+                rr = rr.iloc[0]
+                regime_names = ["bull", "bear", "sideways", "panic", "bull_volatile"]
+                vals = [rr.get(r, np.nan) for r in regime_names]
+                colors = ["#40c4ff", "#ff4081", "#69f0ae", "#ff5252", "#ffab40"]
+                for i, (r, v) in enumerate(zip(regime_names, vals)):
+                    if not np.isnan(v):
+                        bar = pg.BarGraphItem(x=[i], height=[v], width=0.6,
+                                              brush=colors[i], name=r)
+                        regime_plot.addItem(bar)
+                regime_plot.getAxis("bottom").setTicks([list(enumerate(regime_names))])
+
+    # ── Correlation 标签 ──
+
+    def _populate_correlation_from_report(self, report: pd.DataFrame):
+        cached = getattr(self, "_fl_cached", {})
+        corr_matrix = cached.get("corr_matrix")
+
         self.fl_corr_plot.clear()
-        if not corr_df.empty:
-            n = len(corr_df)
+        if corr_matrix is not None and not corr_matrix.empty:
+            n = len(corr_matrix)
             img = pg.ImageItem()
-            img.setImage(corr_df.values)
+            img.setImage(corr_matrix.values)
             img.setRect(-0.5, -0.5, n, n)
             from pyqtgraph import ColorMap
-            cmap = pg.colormap.get("coolwarm")
+            try:
+                cmap = pg.colormap.get("coolwarm")
+            except Exception:
+                cmap = None
             if cmap is None:
                 lut_vals = []
                 for i in range(256):
@@ -752,63 +988,130 @@ class MainWindow(QMainWindow):
                     g = int(255 * (1.0 - abs(i - 127.5) / 127.5))
                     b = int(255 * (1.0 - i / 255.0))
                     lut_vals.append([r, g, b])
-                cmap = ColorMap(np.array(lut_vals, dtype=np.ubyte))
+                colors_arr = np.array(lut_vals, dtype=np.ubyte)
+                pos_arr = np.linspace(0, 1, len(colors_arr))
+                cmap = ColorMap(pos_arr, colors_arr)
             img.setLookupTable(cmap.getLookupTable())
             self.fl_corr_plot.addItem(img)
-            tick_positions = [(i, name) for i, name in enumerate(corr_df.index)]
-            self.fl_corr_plot.getAxis("bottom").setTicks([tick_positions])
-            self.fl_corr_plot.getAxis("left").setTicks([tick_positions])
+            ticks = [(i, name) for i, name in enumerate(corr_matrix.index)]
+            self.fl_corr_plot.getAxis("bottom").setTicks([ticks])
+            self.fl_corr_plot.getAxis("left").setTicks([ticks])
 
-        # ── Regime IC ──
-        self.fl_regime_plot.clear()
-        self.fl_regime_plot.addLegend()
-        if not regime_df.empty:
-            regimes_list = regime_df.columns.drop("factor", errors="ignore").tolist()
-            bar_width = 0.15
-            colors = ["#40c4ff", "#ffd54f", "#00e676", "#ff4081", "#ffab40"]
-            for r_idx, regime_name in enumerate(regimes_list):
-                for f_idx, row in regime_df.iterrows():
-                    val = row.get(regime_name, np.nan)
-                    if not np.isnan(val):
-                        bar = pg.BarGraphItem(
-                            x=[f_idx + r_idx * bar_width], height=[val], width=bar_width,
-                            brush=colors[r_idx % len(colors)], name=regime_name
-                        )
-                        self.fl_regime_plot.addItem(bar)
-            x_ticks = [(i + bar_width * (len(regimes_list) - 1) / 2,
-                        regime_df["factor"].iloc[i]) for i in range(len(regime_df))]
-            self.fl_regime_plot.getAxis("bottom").setTicks([x_ticks])
+        # 高相关对
+        self.fl_corr_pairs_table.setRowCount(0)
+        if corr_matrix is not None and not corr_matrix.empty:
+            pairs = []
+            for i in range(len(corr_matrix)):
+                for j in range(i + 1, len(corr_matrix)):
+                    pairs.append((
+                        corr_matrix.index[i],
+                        corr_matrix.columns[j],
+                        abs(corr_matrix.iloc[i, j]),
+                    ))
+            pairs.sort(key=lambda x: x[2], reverse=True)
+            top_pairs = [p for p in pairs if p[2] > 0.7][:30]
+            self.fl_corr_pairs_table.setRowCount(len(top_pairs))
+            for idx, (a, b, v) in enumerate(top_pairs):
+                self.fl_corr_pairs_table.setItem(idx, 0, QTableWidgetItem(str(a)))
+                self.fl_corr_pairs_table.setItem(idx, 1, QTableWidgetItem(str(b)))
+                self.fl_corr_pairs_table.setItem(idx, 2, QTableWidgetItem(f"{v:.4f}"))
 
-        # ── 汇总表格 ──
-        self.fl_summary_table.clear()
-        if not ic_df.empty:
-            ic_cols = [c for c in ic_df.columns if c != "date"]
-            last_row = ic_df.dropna().iloc[-1] if len(ic_df.dropna()) > 0 else None
-            if last_row is not None:
-                rows = len(ic_cols)
-                self.fl_summary_table.setRowCount(rows)
-                self.fl_summary_table.setColumnCount(4)
-                self.fl_summary_table.setHorizontalHeaderLabels(["因子", "最新RollingIC", "ICIR", "Mean IC (Decay h5)"])
-                for i, col in enumerate(ic_cols):
-                    factor_name = col.replace("ic_", "")
-                    ic_val = last_row.get(col, np.nan)
-                    ic_series = ic_df[col].dropna()
-                    icir = ic_series.mean() / ic_series.std() if len(ic_series) > 1 and ic_series.std() > 0 else np.nan
-                    decay_h5 = np.nan
-                    if not decay_df.empty:
-                        dr = decay_df[decay_df["factor"] == factor_name]
-                        if len(dr) > 0:
-                            decay_h5 = dr["h5"].iloc[0]
-                    self.fl_summary_table.setItem(i, 0, QTableWidgetItem(factor_name))
-                    self.fl_summary_table.setItem(i, 1,
-                        QTableWidgetItem(f"{ic_val:.4f}" if not np.isnan(ic_val) else "N/A"))
-                    self.fl_summary_table.setItem(i, 2,
-                        QTableWidgetItem(f"{icir:.4f}" if not np.isnan(icir) else "N/A"))
-                    self.fl_summary_table.setItem(i, 3,
-                        QTableWidgetItem(f"{decay_h5:.4f}" if not np.isnan(decay_h5) else "N/A"))
+    # ── Approval 标签 ──
 
-        self.fl_compute_btn.setEnabled(True)
-        self.fl_compute_btn.setText("开始计算")
+    def _populate_approval_from_registry(self):
+        from factor_registry import FactorApproval
+        approval = FactorApproval()
+        if not approval.load():
+            approval.build_defaults()
+
+        tree = self.fl_approval_tree
+        tree.clear()
+
+        all_checks = {}
+
+        for g, gdef in FACTOR_GROUPS.items():
+            if g == "auxiliary":
+                continue
+            g_item = QTreeWidgetItem(tree)
+            g_item.setText(0, f"{gdef['name']} ({g})")
+            g_item.setFlags(g_item.flags() | Qt.ItemIsUserCheckable)
+            g_item.setCheckState(0, Qt.Checked)
+
+            for f_key in FACTOR_REGISTRY:
+                info = FACTOR_REGISTRY[f_key]
+                if info.get("group") != g:
+                    continue
+                f_item = QTreeWidgetItem(g_item)
+                active = f_key in approval.get_active_factors(g)
+                excluded = f_key in approval.get_excluded_factors()
+                status = "启用" if active else ("排除" if excluded else "未启用")
+                f_item.setText(0, f"{info['name']} ({f_key})")
+                f_item.setText(1, status)
+                f_item.setFlags(f_item.flags() | Qt.ItemIsUserCheckable)
+                f_item.setCheckState(0, Qt.Checked if active else Qt.Unchecked)
+                f_item.setData(0, Qt.UserRole, f_key)
+                all_checks[f_key] = f_item
+
+        self._fl_approval_checks = all_checks
+        self._fl_approval = approval
+
+        # Regime 映射表
+        table = self.fl_regime_map_table
+        regimes_list = ["bull", "bull_volatile", "bear", "panic", "sideways"]
+        groups_list = [g for g in get_factor_groups() if g != "auxiliary"]
+        for i, r in enumerate(regimes_list):
+            rmap = approval.get_regime_groups(r)
+            include = rmap.get("include_groups", [])
+            for j, g in enumerate(groups_list):
+                checked = g in include
+                item = QTableWidgetItem("☑" if checked else "☐")
+                item.setTextAlignment(Qt.AlignCenter)
+                table.setItem(i, j + 1, item)
+
+    def _on_approval_save(self):
+        if not hasattr(self, "_fl_approval"):
+            return
+        approval = self._fl_approval
+        # 从tree读取勾选状态
+        groups_data = {}
+        tree = self.fl_approval_tree
+        for i in range(tree.topLevelItemCount()):
+            g_item = tree.topLevelItem(i)
+            g_name = g_item.text(0).split(" (")[-1].rstrip(")")
+            active = []
+            excluded = []
+            for j in range(g_item.childCount()):
+                f_item = g_item.child(j)
+                f_key = f_item.data(0, Qt.UserRole)
+                if f_item.checkState(0) == Qt.Checked:
+                    active.append(f_key)
+                else:
+                    excluded.append(f_key)
+            groups_data[g_name] = {
+                "active_factors": active,
+                "excluded_factors": excluded,
+                "reason": approval.data.get("groups", {}).get(g_name, {}).get("reason", ""),
+            }
+        approval.data["groups"] = groups_data
+        approval.save()
+        QMessageBox.information(self, "保存", "审批配置已保存")
+
+    def _on_approval_load(self):
+        from factor_registry import FactorApproval
+        approval = FactorApproval()
+        if approval.load():
+            self._fl_approval = approval
+            self._populate_approval_from_registry()
+            QMessageBox.information(self, "加载", "审批配置已加载")
+        else:
+            QMessageBox.warning(self, "加载", "未找到已保存的审批配置")
+
+    def _on_approval_reset(self):
+        from factor_registry import FactorApproval
+        approval = FactorApproval()
+        approval.build_defaults()
+        self._fl_approval = approval
+        self._populate_approval_from_registry()
 
     # ==========================================
     # 数据下载页面
@@ -1677,22 +1980,62 @@ class MainWindow(QMainWindow):
             "max_corr_overlap":       [0.05, 0.10, 0.15, 0.20],
         }
 
+        def _build_explain_groups(trend, risk, vol, struct, cons, meanrev, use_ap, ap):
+            """构建 explain_groups，优先使用审批配置中的 regime 映射。"""
+            groups = {
+                "trend":    {"factors": trend,   "regimes": ["bull", "bull_volatile"]},
+                "risk":     {"factors": risk,    "regimes": ["bull", "bull_volatile", "bear", "panic", "sideways"]},
+                "volume":   {"factors": vol,     "regimes": ["bull", "bull_volatile", "bear", "panic", "sideways"]},
+                "structure":{"factors": struct,  "regimes": ["bull", "bull_volatile", "sideways"]},
+                "structure_bear": {"factors": ["barra_beta", "corr_hs300_60"], "regimes": ["bear", "panic"], "transform": "beta_penalty"},
+                "mean_reversion": {"factors": meanrev, "regimes": ["sideways"]},
+            }
+            if cons and cons != ["trend_consistency"]:
+                groups["consistency"] = {"factors": cons, "regimes": ["bull", "bull_volatile"]}
+            if use_ap and ap is not None:
+                for regime_name in ["bull", "bull_volatile", "bear", "panic", "sideways"]:
+                    rmap = ap.get_regime_groups(regime_name)
+                    include = rmap.get("include_groups", [])
+                    for g in groups:
+                        if "regimes" in groups[g]:
+                            if g in include:
+                                if regime_name not in groups[g]["regimes"]:
+                                    groups[g]["regimes"].append(regime_name)
+                            else:
+                                groups[g]["regimes"] = [r for r in groups[g]["regimes"] if r != regime_name]
+            return groups
+
         def build_strategy(params: dict):
             top_n = int(params.get("top_n", 3))
             exit_q = float(params.get("exit_rank_threshold", 0) or 0)
             stop_loss = float(params.get("stop_loss", 0) or 0)
 
-            # ── 固定因子分组得分（组内 rank 均值）──
-            # trend_score  = mean(rank(roc20), rank(roc60), rank(breakout20), rank(relative_strength_vs_hs300))
-            # risk_score   = mean(rank(volatility20), rank(downside_volatility), rank(max_drawdown20))
-            # volume_score = mean(rank(turnover_change), rank(vol_ratio20))
-            # structure_score = mean(rank(barra_beta), rank(corr_hs300_60))
-            # mean_reversion_score = rank(ma_distance)
-
-            _trend_raw = ["roc20", "roc60", "breakout20", "relative_strength_vs_hs300"]
-            _risk_raw  = ["volatility20", "downside_volatility", "max_drawdown20"]
-            _vol_raw   = ["turnover_change", "vol_ratio20"]
-            _struct_raw = ["barra_beta", "corr_hs300_60"]
+            # ── 读取审批后的活跃因子（如有 approved_factors.json 则用审批结果）──
+            from factor_registry import FactorApproval
+            approval = FactorApproval()
+            if approval.load():
+                _trend_raw  = approval.get_active_factors("trend") or FACTOR_GROUPS.get("trend", {}).get("factors", ["roc20"])
+                _risk_raw   = approval.get_active_factors("risk") or FACTOR_GROUPS.get("risk", {}).get("factors", ["volatility20"])
+                _vol_raw    = approval.get_active_factors("volume") or FACTOR_GROUPS.get("volume", {}).get("factors", ["turnover_change"])
+                _struct_raw = approval.get_active_factors("structure") or FACTOR_GROUPS.get("structure", {}).get("factors", ["barra_beta"])
+                _cons_raw   = approval.get_active_factors("consistency") or FACTOR_GROUPS.get("consistency", {}).get("factors", ["trend_consistency"])
+                _meanrev_raw = approval.get_active_factors("mean_reversion") or FACTOR_GROUPS.get("mean_reversion", {}).get("factors", ["ma_distance"])
+                # 从审批结果读取 regime 映射
+                bull_rmap = approval.get_regime_groups("bull")
+                bear_rmap = approval.get_regime_groups("bear")
+                sideways_rmap = approval.get_regime_groups("sideways")
+                use_approval = True
+            else:
+                _trend_raw  = list(FACTOR_GROUPS.get("trend", {}).get("factors", ["roc20"]))
+                _risk_raw   = list(FACTOR_GROUPS.get("risk", {}).get("factors", ["volatility20"]))
+                _vol_raw    = list(FACTOR_GROUPS.get("volume", {}).get("factors", ["turnover_change"]))
+                _struct_raw = list(FACTOR_GROUPS.get("structure", {}).get("factors", ["barra_beta"]))
+                _cons_raw   = list(FACTOR_GROUPS.get("consistency", {}).get("factors", ["trend_consistency"]))
+                _meanrev_raw = list(FACTOR_GROUPS.get("mean_reversion", {}).get("factors", ["ma_distance"]))
+                bull_rmap = {}
+                bear_rmap = {}
+                sideways_rmap = {}
+                use_approval = False
 
             def _group_mean(factors):
                 if len(factors) == 1:
@@ -1780,14 +2123,10 @@ class MainWindow(QMainWindow):
                     },
                 },
                 # 分组定义：用于策略解释器精确分解得分
-                "explain_groups": {
-                    "trend":    {"factors": _trend_raw,   "regimes": ["bull", "bull_volatile"]},
-                    "risk":     {"factors": _risk_raw,    "regimes": ["bull", "bull_volatile", "bear", "panic", "sideways"]},
-                    "volume":   {"factors": _vol_raw,     "regimes": ["bull", "bull_volatile", "bear", "panic", "sideways"]},
-                    "structure":{"factors": _struct_raw,  "regimes": ["bull", "bull_volatile", "sideways"]},
-                    "structure_bear": {"factors": ["barra_beta", "corr_hs300_60"], "regimes": ["bear", "panic"], "transform": "beta_penalty"},
-                    "mean_reversion": {"factors": ["ma_distance"], "regimes": ["sideways"]},
-                },
+                "explain_groups": _build_explain_groups(
+                    _trend_raw, _risk_raw, _vol_raw, _struct_raw,
+                    _cons_raw, _meanrev_raw, use_approval, approval if use_approval else None,
+                ),
                 "sell_rule": sell_rule,
                 "execution": {
                     "decision_at": "close",
@@ -2413,12 +2752,7 @@ class MainWindow(QMainWindow):
             explain_groups = stg.get("explain_groups", {})
             if not explain_groups:
                 # 兜底：旧策略无 explain_groups，用默认定义
-                explain_groups = {
-                    "trend":    {"factors": ["roc20", "roc60", "breakout20", "relative_strength_vs_hs300"]},
-                    "risk":     {"factors": ["volatility20", "downside_volatility", "max_drawdown20"]},
-                    "volume":   {"factors": ["turnover_change", "vol_ratio20"]},
-                    "structure":{"factors": ["barra_beta", "corr_hs300_60"]},
-                }
+                explain_groups = _fallback_explain_groups()
 
             lines = [f"=== 策略解释器 [{last_date}] ==="]
 
