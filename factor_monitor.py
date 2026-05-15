@@ -16,23 +16,9 @@ import pandas as pd
 from scipy.stats import spearmanr
 
 
-# Factor groups matching the strategy builder's FACTOR_GROUPS
-FACTOR_GROUPS = {
-    "trend":    ["roc20", "roc60", "breakout20", "relative_strength_vs_hs300"],
-    "risk":     ["volatility20", "downside_volatility", "max_drawdown20"],
-    "volume":   ["turnover_change", "vol_ratio20"],
-    "structure": ["barra_beta", "corr_hs300_60"],
-    "meanrev": ["ma_distance"],
-}
+from factor_registry import get_active_factors_for_strategy, GROUP_REPRESENTATIVES
 
-# Representative factor per group (used for IC computation)
-GROUP_REPRESENTATIVES = {
-    "trend":    "roc20",
-    "risk":     "volatility20",
-    "volume":   "vol_ratio20",
-    "structure": "barra_beta",
-    "meanrev": "ma_distance",
-}
+FACTOR_GROUPS = get_active_factors_for_strategy()
 
 # Column naming: prefix for dynamic weight columns
 DW_PREFIX = "dw_"

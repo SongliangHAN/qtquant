@@ -274,6 +274,7 @@ class MarketRegimeDetector:
         m["breadth_roc20"] = b_roc20["breadth_roc20_smooth"]
         m["breadth_newhigh"] = b_newhigh["breadth_newhigh_smooth"]
         m["breadth_dispersion"] = b_disp["dispersion_smooth"]
+        m["breadth"] = b_up["breadth"]
 
         # dispersion 归一化到 0~1（expanding window：每期只用当期及之前的数据，无未来泄露）
         m["d_expand_min"] = m["breadth_dispersion"].expanding().min()
