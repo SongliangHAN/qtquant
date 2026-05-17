@@ -569,6 +569,7 @@ class ResearchDataService:
             log_cb(f"全部指标完成，共 {len(full)} 行，开始横截面因子...")
 
         # 第二步：HS300 relative strength
+        rel_str = pd.DataFrame()
         bench = full[full["code"] == "510300"][["date", "ret20"]]
         if not bench.empty:
             bench = bench.rename(columns={"ret20": "hs300_ret20"})

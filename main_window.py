@@ -708,6 +708,11 @@ class MainWindow(QMainWindow):
         right.addWidget(self.fl_regime_map_table)
 
         btn_layout = QHBoxLayout()
+        suggest_btn = QPushButton("从研究结果建议")
+        suggest_btn.clicked.connect(self._on_approval_auto_suggest)
+        suggest_btn.setToolTip("基于因子研究指标（IC/ICIR/覆盖率）自动建议启用/排除")
+        btn_layout.addWidget(suggest_btn)
+        btn_layout.addStretch()
         save_btn = QPushButton("保存审批配置")
         save_btn.clicked.connect(self._on_approval_save)
         btn_layout.addWidget(save_btn)
@@ -1152,6 +1157,21 @@ class MainWindow(QMainWindow):
         approval.build_defaults()
         self._fl_approval = approval
         self._populate_approval_from_registry()
+
+    def _on_approval_auto_suggest(self):
+        report = getattr(self, "_fl_report", None)
+        if report is None or report.empty:
+            QMessageBox.warning(self, "提示", "请先运行因子研究，生成报告后再使用自动建议。")
+            return
+        if not hasattr(self, "_fl_approval") or self._fl_approval is None:
+            from factor_registry import FactorApproval
+            self._fl_approval = FactorApproval()
+            self._fl_approval.build_defaults()
+        self._fl_approval.apply_research_suggestions(report)
+        self._populate_approval_from_registry()
+        QMessageBox.information(self, "建议已生成",
+            "因子研究指标已转换为审批建议，请检查各因子组的状态。\n"
+            "规则：覆盖率<50% 或 |ICIR|<0.15 的因子建议排除，其余建议启用。")
 
     # ==========================================
     # 数据下载页面

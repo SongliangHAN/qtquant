@@ -21,7 +21,7 @@ class MarketRegimeDetector:
     """
 
     def __init__(self,
-                 vol_threshold: float = 0.30,
+                 vol_threshold: float = 0.22,
                  ma_short: int = 50,
                  ma_long: int = 200):
         self.vol_threshold = vol_threshold
@@ -98,8 +98,8 @@ class MarketRegimeDetector:
         """
         带滞后平滑的市场状态检测（防止频繁抖动切换）。
 
-        persistence: 连续N天满足新状态条件后才正式切换。
-                     只在原始状态持续≥persistence天时才发出切换信号。
+        persistence: 连续N天偏离当前状态后，切换为最近偏离期内的多数状态。
+                     可处理原始信号在 bull/sideways/bear 之间的三向振荡。
 
         输出的 regime 列不会有"日频抖动"，回测时更接近真实决策逻辑。
         """
@@ -109,34 +109,28 @@ class MarketRegimeDetector:
         n = len(regimes)
 
         current = regimes[0]
-        current_start = 0
-        pending = None
-        pending_start = 0
+        deviation_start = -1  # 开始偏离 current 的索引
 
         for i in range(1, n):
             r = regimes[i]
             if r == current:
-                # 持续当前状态
-                pending = None
+                # 回到当前状态，重置偏离计数
+                deviation_start = -1
             else:
-                # 出现新候选状态
-                if pending is None:
-                    pending = r
-                    pending_start = i
-                elif r == pending:
-                    # 候选状态持续中
-                    if i - pending_start + 1 >= persistence:
-                        # 确认切换：只回填 pending 期间的观测值（避免引入未来信息）
-                        for j in range(pending_start, i + 1):
-                            smoothed[j] = pending
-                        current = pending
-                        current_start = pending_start
-                        pending = None
-                else:
-                    # 又变了，重置候选
-                    pending = r
-                    pending_start = i
-            # 填入当前状态
+                if deviation_start < 0:
+                    deviation_start = i
+                # 连续偏离天数
+                streak = i - deviation_start + 1
+                if streak >= persistence:
+                    # 确认切换：取偏离期内出现最多的原始状态
+                    from collections import Counter
+                    segment = list(regimes[deviation_start:i + 1])
+                    new_regime = Counter(segment).most_common(1)[0][0]
+                    # 回填偏离期
+                    for j in range(deviation_start, i + 1):
+                        smoothed[j] = new_regime
+                    current = new_regime
+                    deviation_start = -1
             smoothed[i] = current
 
         df["regime_raw"] = df["regime"]  # 保留原始值

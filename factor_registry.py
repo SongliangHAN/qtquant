@@ -489,6 +489,51 @@ class FactorApproval:
             "regime_factor_map": regime_map,
         }
 
+    def apply_research_suggestions(self, report: pd.DataFrame):
+        """根据因子研究指标自动建议启用/排除。
+
+        规则：
+          - coverage_pct < 50%  →  建议排除（数据不足）
+          - abs(icir) < 0.15    →  建议排除（IC不显著）
+          - 以上都满足          →  建议启用
+        """
+        if report is None or report.empty:
+            return
+        groups_data = self.data.get("groups", {})
+        if not groups_data:
+            return
+        report_idx = report.set_index("factor")
+        for g_name, g_data in groups_data.items():
+            all_factors = g_data.get("active_factors", []) + g_data.get("excluded_factors", [])
+            suggested_active = []
+            suggested_excluded = []
+            reasons = []
+            for f_key in all_factors:
+                if f_key not in report_idx.index:
+                    suggested_active.append(f_key)
+                    continue
+                row = report_idx.loc[f_key]
+                coverage = float(row.get("coverage_pct", 0) or 0)
+                icir = float(row.get("icir", 0) or 0)
+                mean_ic = float(row.get("mean_ic", 0) or 0)
+                issues = []
+                if coverage < 50:
+                    issues.append(f"低覆盖率({coverage:.0f}%)")
+                if abs(icir) < 0.15:
+                    issues.append(f"低ICIR({icir:.3f})")
+                if issues:
+                    suggested_excluded.append(f_key)
+                    info = get_factor_info(f_key) or {}
+                    reasons.append(f"{info.get('name', f_key)}: {'; '.join(issues)}")
+                else:
+                    suggested_active.append(f_key)
+                    info = get_factor_info(f_key) or {}
+                    reasons.append(f"{info.get('name', f_key)}: IC={mean_ic:.3f}, ICIR={icir:.3f}, Cov={coverage:.0f}%")
+            g_data["active_factors"] = suggested_active
+            g_data["excluded_factors"] = suggested_excluded
+            g_data["reason"] = " | ".join(reasons) if reasons else ""
+        self.data["last_modified"] = datetime.now().isoformat()
+
     def get_active_factors(self, group: str | None = None) -> list[str]:
         groups = self.data.get("groups", {})
         if group:
