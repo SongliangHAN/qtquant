@@ -162,17 +162,21 @@ class FactorLab:
         if factors is None:
             factors = list(GROUP_REPRESENTATIVES.values())
         factors = [f for f in factors if f in self.data.columns]
+        # Exclude factors with no usable data, otherwise dropna() kills all rows
+        usable = [f for f in factors if self.data[f].notna().sum() >= 5]
+        if not usable:
+            return pd.DataFrame(index=factors, columns=factors)
         dates = sorted(self.data["date"].unique())
         corr_mats = []
         for d in dates:
-            sub = self.data[self.data["date"] == d][factors].dropna()
+            sub = self.data[self.data["date"] == d][usable].dropna()
             if len(sub) < 5:
                 continue
             corr_mats.append(sub.corr().values)
         if not corr_mats:
             return pd.DataFrame(index=factors, columns=factors)
         avg_corr = np.mean(corr_mats, axis=0)
-        return pd.DataFrame(avg_corr, index=factors, columns=factors)
+        return pd.DataFrame(avg_corr, index=usable, columns=usable)
 
     # ── Regime IC ─────────────────────────────────────────────
     def compute_regime_ic(

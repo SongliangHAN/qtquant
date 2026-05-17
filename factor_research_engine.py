@@ -27,7 +27,7 @@ class FactorResearchEngine:
         """
         data: long-form DataFrame with [date, code, close] + factor columns + regime.
         """
-        self.data = data.sort_values(["code", "date"]).copy()
+        self.data = data.sort_values(["code", "date"]).drop_duplicates(subset=["date", "code"]).copy()
         self.lab = FactorLab(data)
         self._available = self._find_available_factors()
 
@@ -401,6 +401,7 @@ class FactorResearchEngine:
             # 每日截面 rank，计算 rank 的日间变化
             df = self.data[["date", "code"]].copy()
             df["_val"] = col
+            df = df.drop_duplicates(subset=["date", "code"])
             df["_rank"] = df.groupby("date")["_val"].rank(pct=True)
             ranked = df.pivot(index="date", columns="code", values="_rank")
             changes = ranked.diff().abs().mean(axis=1)
@@ -583,6 +584,8 @@ class FactorResearchEngine:
             # Average ETFs per date
             row["n_obs_pool"] = 0
 
+            rows.append(row)
+
         report = pd.DataFrame(rows)
 
         # Compute max_pairwise_corr from corr_matrix
@@ -590,9 +593,10 @@ class FactorResearchEngine:
             for f in factors:
                 if f in corr_matrix.index:
                     abs_corr = corr_matrix.loc[f].drop(f, errors="ignore").abs()
-                    if len(abs_corr) > 0:
-                        max_idx = abs_corr.idxmax()
-                        max_val = abs_corr.max()
+                    valid = abs_corr.dropna()
+                    if len(valid) > 0:
+                        max_idx = valid.idxmax()
+                        max_val = valid.max()
                         mask = report["factor"] == f
                         report.loc[mask, "max_pairwise_corr"] = max_val
                         report.loc[mask, "max_corr_with"] = max_idx

@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import *
 from PySide6.QtCore import *
-from PySide6.QtGui import QDesktopServices, QColor
+from PySide6.QtGui import QDesktopServices, QColor, QStandardItemModel, QStandardItem
 from PySide6.QtCore import QUrl
 
 import os
@@ -727,6 +727,10 @@ class MainWindow(QMainWindow):
 
     def _on_fl_compute(self):
         codes = [x["code"] for x in self.ds.get_all_etf()]
+        codes_available = [c for c in codes if self.research.exists(c)]
+        if len(codes_available) < 3:
+            QMessageBox.warning(self, "提示", "请先点击「构建研究数据」完成预处理，再运行全量研究。")
+            return
         horizon = self.fl_horizon.value()
         window = self.fl_window.value()
         n_q = self.fl_n_quantiles.value()
@@ -972,9 +976,12 @@ class MainWindow(QMainWindow):
 
         self.fl_corr_plot.clear()
         if corr_matrix is not None and not corr_matrix.empty:
+            vals = corr_matrix.values.astype(np.float64)
+            if np.isnan(vals).all():
+                return
             n = len(corr_matrix)
             img = pg.ImageItem()
-            img.setImage(corr_matrix.values)
+            img.setImage(vals)
             img.setRect(-0.5, -0.5, n, n)
             from pyqtgraph import ColorMap
             try:

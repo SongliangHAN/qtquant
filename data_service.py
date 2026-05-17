@@ -482,6 +482,10 @@ class ResearchDataService:
         # 时间序列指标
         df = indicator_engine.calculate(df)
 
+        # 移除占位列（由横截面阶段填充真实值）
+        if "relative_strength_vs_hs300" in df.columns:
+            df = df.drop(columns=["relative_strength_vs_hs300"])
+
         # 横截面因子 merge
         if cross_factors is not None and not cross_factors.empty:
             cross = cross_factors[cross_factors["code"] == code]
@@ -571,6 +575,12 @@ class ResearchDataService:
             full = pd.merge(full, bench, on="date", how="left")
             full["relative_strength_vs_hs300"] = full["ret20"] - full["hs300_ret20"]
 
+            # 转换为横截面格式以通过 build() → parquet 持久化
+            rel_str = full[["date", "code"]].copy()
+            rel_str["factor_name"] = "relative_strength_vs_hs300"
+            rel_str["factor_value"] = full["relative_strength_vs_hs300"]
+            rel_str = rel_str.dropna(subset=["factor_value"])
+
         # 第三步：横截面因子
         cross_mom = factor_engine.cross_section_momentum(full)
         cross_vol = factor_engine.cross_volatility(full)
@@ -584,7 +594,7 @@ class ResearchDataService:
         beta = factor_engine.barra_beta(full, hs300_df=hs300_data)
 
         # 合并全部横截面
-        cross_all = pd.concat([cross_mom, cross_vol, corr, beta], ignore_index=True)
+        cross_all = pd.concat([cross_mom, cross_vol, corr, beta, rel_str], ignore_index=True)
         if log_cb:
             log_cb(f"横截面因子完成，共 {len(cross_all)} 条")
 
