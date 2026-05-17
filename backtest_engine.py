@@ -797,6 +797,7 @@ class BacktestEngine:
                     "holding_value": holding_value,
                     "positions": len(positions),
                     "halted": len(halted_codes),
+                    "regime": str(current_regime) if current_regime else "unknown",
                 }
             )
             if progress_cb and t_idx % 100 == 0:

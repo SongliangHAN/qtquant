@@ -116,6 +116,9 @@ class BacktestChartWidget(QWidget):
 
         self.axis_nav.dates = dates
 
+        # ── 市场 regime 背景色 ──
+        self._draw_regime_background(eq, x, nav)
+
         # 净值曲线
         self.p1.plot(x, nav, pen=pg.mkPen("#40c4ff", width=2.5), name="策略")
 
@@ -168,7 +171,42 @@ class BacktestChartWidget(QWidget):
         # ── 持仓表 ──
         self._build_holdings_table(equity_df, trades)
 
-    # ───── 持仓明细表 ─────
+    # ───── regime 背景色 ─────
+
+    _REGIME_COLORS = {
+        "bull": (204, 255, 204, 80),           # 浅绿
+        "bear": (255, 204, 204, 80),           # 浅红
+        "sideways": (204, 224, 240, 80),        # 浅蓝灰
+        "panic": (255, 180, 180, 100),          # 深粉
+        "bull_volatile": (255, 230, 180, 80),   # 浅橙
+        "unknown": (240, 240, 240, 40),         # 浅灰
+    }
+
+    def _draw_regime_background(self, eq, x, nav):
+        """用五种浅色背景区分五种市场 regime。"""
+        if "regime" not in eq.columns:
+            return
+        y_min = float(nav.min()) * 0.95
+        y_max = float(nav.max()) * 1.05
+        regimes = eq["regime"].tolist()
+        n = len(regimes)
+        if n == 0:
+            return
+        i = 0
+        while i < n:
+            cur = regimes[i]
+            j = i
+            while j < n and regimes[j] == cur:
+                j += 1
+            rgba = self._REGIME_COLORS.get(str(cur), self._REGIME_COLORS["unknown"])
+            brush = pg.mkBrush(*rgba)
+            # 从 i-0.5 到 j-0.5 确保相邻 regime 无缝衔接（半个 bar 宽度重合）
+            rect = pg.QtWidgets.QGraphicsRectItem(float(i) - 0.5, y_min, float(j - i), y_max - y_min)
+            rect.setBrush(brush)
+            rect.setPen(pg.mkPen(None))  # 无边框
+            rect.setZValue(-10)
+            self.p1.addItem(rect)
+            i = j
     def _build_holdings_table(self, equity_df, trades):
         self.holdings_table.setRowCount(0)
 
