@@ -2483,6 +2483,10 @@ class MainWindow(QMainWindow):
             import traceback
             print(f"[build_backtest_data] dw 权重计算失败: {e}\n{traceback.format_exc()}")
 
+        # 确保所有 5 个 dw_* 列存在（若 FactorMonitor 未产出则用默认等权 0.2）
+        for col in ["dw_trend", "dw_volume", "dw_structure", "dw_risk", "dw_meanrev"]:
+            if col not in data.columns:
+                data[col] = 0.2
         return data
 
     def _build_backtest_data_fallback(self, codes, start, end):

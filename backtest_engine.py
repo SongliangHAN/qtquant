@@ -417,6 +417,7 @@ class BacktestEngine:
         for t in dates:
             t_idx = date_index[t]
             day = data[data["date"] == t].drop_duplicates("code").set_index("code")
+            current_regime = "unknown"
             # 预建 dict 加速后续标量查找（dict.get() 比 .loc[] 快）
             day_open = day["open"].to_dict()
             day_close = day["close"].to_dict() if "close" in day.columns else {}
