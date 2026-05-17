@@ -9,10 +9,6 @@ import shutil
 import pandas as pd
 import numpy as np
 import pyqtgraph as pg
-try:
-    from pyqtgraph import ColorMap
-except ImportError:
-    ColorMap = None
 from datetime import datetime, timedelta
 
 from data_service import DataService
@@ -671,9 +667,10 @@ class MainWindow(QMainWindow):
 
         subtabs = QTabWidget()
 
-        # 热力图
-        self.fl_corr_plot = pg.PlotWidget(title="因子相关性热力图")
-        subtabs.addTab(self.fl_corr_plot, "热力图")
+        # 热力图 — 使用 QTableWidget 避免 pyqtgraph segfault
+        self.fl_corr_heatmap = QTableWidget()
+        self.fl_corr_heatmap.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        subtabs.addTab(self.fl_corr_heatmap, "热力图")
 
         # 高相关对表格
         self.fl_corr_pairs_table = QTableWidget()
@@ -978,55 +975,54 @@ class MainWindow(QMainWindow):
         cached = getattr(self, "_fl_cached", {})
         corr_matrix = cached.get("corr_matrix")
 
-        self.fl_corr_plot.clear()
-        if corr_matrix is not None and not corr_matrix.empty:
-            vals = corr_matrix.values.astype(np.float64)
-            if np.isnan(vals).all():
-                return
-            n = len(corr_matrix)
-            self.fl_corr_plot.setUpdatesEnabled(False)
-            try:
-                img = pg.ImageItem()
-                img.setImage(vals)
-                img.setRect(-0.5, -0.5, n, n)
-                if ColorMap is not None:
-                    try:
-                        cmap = pg.colormap.get("coolwarm")
-                    except Exception:
-                        cmap = None
+        # ── 热力图 (QTableWidget) ──
+        heatmap = self.fl_corr_heatmap
+        heatmap.setUpdatesEnabled(False)
+        try:
+            if corr_matrix is not None and not corr_matrix.empty:
+                vals = corr_matrix.values.astype(np.float64)
+                if np.isnan(vals).all():
+                    heatmap.setRowCount(0)
+                    heatmap.setColumnCount(0)
                 else:
-                    cmap = None
-                if cmap is None:
-                    lut_vals = []
-                    for i in range(256):
-                        r = int(255 * (i / 255.0))
-                        g = int(255 * (1.0 - abs(i - 127.5) / 127.5))
-                        b = int(255 * (1.0 - i / 255.0))
-                        lut_vals.append([r, g, b])
-                    colors_arr = np.array(lut_vals, dtype=np.ubyte)
-                    pos_arr = np.linspace(0, 1, len(colors_arr))
-                    cmap = ColorMap(pos_arr, colors_arr)
-                img.setLookupTable(cmap.getLookupTable())
-                self.fl_corr_plot.addItem(img)
-                ticks = [(i, name) for i, name in enumerate(corr_matrix.index)]
-                self.fl_corr_plot.getAxis("bottom").setTicks([ticks])
-                self.fl_corr_plot.getAxis("left").setTicks([ticks])
-            finally:
-                self.fl_corr_plot.setUpdatesEnabled(True)
+                    n = len(corr_matrix)
+                    labels = list(corr_matrix.index)
+                    heatmap.setRowCount(n)
+                    heatmap.setColumnCount(n)
+                    heatmap.setHorizontalHeaderLabels(labels)
+                    heatmap.setVerticalHeaderLabels(labels)
+                    for i in range(n):
+                        for j in range(n):
+                            v = float(vals[i, j])
+                            item = QTableWidgetItem(f"{v:.2f}")
+                            if not np.isnan(v):
+                                # coolwarm colormap: -1=blue, 0=white, 1=red
+                                r, g, b = self._corr_color(v)
+                                item.setBackground(QColor(r, g, b))
+                                # 白/黑色文字根据背景亮度
+                                if (r * 299 + g * 587 + b * 114) / 1000 < 128:
+                                    item.setForeground(QColor(255, 255, 255))
+                            heatmap.setItem(i, j, item)
+                    heatmap.resizeColumnsToContents()
+                    heatmap.resizeRowsToContents()
+            else:
+                heatmap.setRowCount(0)
+                heatmap.setColumnCount(0)
+        finally:
+            heatmap.setUpdatesEnabled(True)
 
-        # 高相关对
+        # ── 高相关对 ──
         self.fl_corr_pairs_table.setUpdatesEnabled(False)
         try:
             self.fl_corr_pairs_table.setRowCount(0)
             if corr_matrix is not None and not corr_matrix.empty:
                 pairs = []
-                for i in range(len(corr_matrix)):
-                    for j in range(i + 1, len(corr_matrix)):
-                        pairs.append((
-                            corr_matrix.index[i],
-                            corr_matrix.columns[j],
-                            abs(corr_matrix.iloc[i, j]),
-                        ))
+                n = len(corr_matrix)
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        v = float(corr_matrix.iloc[i, j])
+                        if not np.isnan(v):
+                            pairs.append((corr_matrix.index[i], corr_matrix.columns[j], abs(v)))
                 pairs.sort(key=lambda x: x[2], reverse=True)
                 top_pairs = [p for p in pairs if p[2] > 0.7][:30]
                 self.fl_corr_pairs_table.setRowCount(len(top_pairs))
@@ -1036,6 +1032,24 @@ class MainWindow(QMainWindow):
                     self.fl_corr_pairs_table.setItem(idx, 2, QTableWidgetItem(f"{v:.4f}"))
         finally:
             self.fl_corr_pairs_table.setUpdatesEnabled(True)
+
+    @staticmethod
+    def _corr_color(v: float):
+        """coolwarm colormap: -1 → blue, 0 → white, 1 → red."""
+        t = max(-1.0, min(1.0, v))
+        if t < 0:
+            # blue → white
+            s = 1.0 + t  # 0 to 1
+            r = int(59 + (255 - 59) * s)
+            g = int(76 + (255 - 76) * s)
+            b = int(192 + (255 - 192) * s)
+        else:
+            # white → red
+            s = t  # 0 to 1
+            r = int(255 - (255 - 180) * s)
+            g = int(255 - (255 - 4) * s)
+            b = int(255 - (255 - 38) * s)
+        return (r, g, b)
 
     # ── Approval 标签 ──
 
