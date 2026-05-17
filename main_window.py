@@ -9,6 +9,10 @@ import shutil
 import pandas as pd
 import numpy as np
 import pyqtgraph as pg
+try:
+    from pyqtgraph import ColorMap
+except ImportError:
+    ColorMap = None
 from datetime import datetime, timedelta
 
 from data_service import DataService
@@ -980,48 +984,58 @@ class MainWindow(QMainWindow):
             if np.isnan(vals).all():
                 return
             n = len(corr_matrix)
-            img = pg.ImageItem()
-            img.setImage(vals)
-            img.setRect(-0.5, -0.5, n, n)
-            from pyqtgraph import ColorMap
+            self.fl_corr_plot.setUpdatesEnabled(False)
             try:
-                cmap = pg.colormap.get("coolwarm")
-            except Exception:
-                cmap = None
-            if cmap is None:
-                lut_vals = []
-                for i in range(256):
-                    r = int(255 * (i / 255.0))
-                    g = int(255 * (1.0 - abs(i - 127.5) / 127.5))
-                    b = int(255 * (1.0 - i / 255.0))
-                    lut_vals.append([r, g, b])
-                colors_arr = np.array(lut_vals, dtype=np.ubyte)
-                pos_arr = np.linspace(0, 1, len(colors_arr))
-                cmap = ColorMap(pos_arr, colors_arr)
-            img.setLookupTable(cmap.getLookupTable())
-            self.fl_corr_plot.addItem(img)
-            ticks = [(i, name) for i, name in enumerate(corr_matrix.index)]
-            self.fl_corr_plot.getAxis("bottom").setTicks([ticks])
-            self.fl_corr_plot.getAxis("left").setTicks([ticks])
+                img = pg.ImageItem()
+                img.setImage(vals)
+                img.setRect(-0.5, -0.5, n, n)
+                if ColorMap is not None:
+                    try:
+                        cmap = pg.colormap.get("coolwarm")
+                    except Exception:
+                        cmap = None
+                else:
+                    cmap = None
+                if cmap is None:
+                    lut_vals = []
+                    for i in range(256):
+                        r = int(255 * (i / 255.0))
+                        g = int(255 * (1.0 - abs(i - 127.5) / 127.5))
+                        b = int(255 * (1.0 - i / 255.0))
+                        lut_vals.append([r, g, b])
+                    colors_arr = np.array(lut_vals, dtype=np.ubyte)
+                    pos_arr = np.linspace(0, 1, len(colors_arr))
+                    cmap = ColorMap(pos_arr, colors_arr)
+                img.setLookupTable(cmap.getLookupTable())
+                self.fl_corr_plot.addItem(img)
+                ticks = [(i, name) for i, name in enumerate(corr_matrix.index)]
+                self.fl_corr_plot.getAxis("bottom").setTicks([ticks])
+                self.fl_corr_plot.getAxis("left").setTicks([ticks])
+            finally:
+                self.fl_corr_plot.setUpdatesEnabled(True)
 
         # 高相关对
-        self.fl_corr_pairs_table.setRowCount(0)
-        if corr_matrix is not None and not corr_matrix.empty:
-            pairs = []
-            for i in range(len(corr_matrix)):
-                for j in range(i + 1, len(corr_matrix)):
-                    pairs.append((
-                        corr_matrix.index[i],
-                        corr_matrix.columns[j],
-                        abs(corr_matrix.iloc[i, j]),
-                    ))
-            pairs.sort(key=lambda x: x[2], reverse=True)
-            top_pairs = [p for p in pairs if p[2] > 0.7][:30]
-            self.fl_corr_pairs_table.setRowCount(len(top_pairs))
-            for idx, (a, b, v) in enumerate(top_pairs):
-                self.fl_corr_pairs_table.setItem(idx, 0, QTableWidgetItem(str(a)))
-                self.fl_corr_pairs_table.setItem(idx, 1, QTableWidgetItem(str(b)))
-                self.fl_corr_pairs_table.setItem(idx, 2, QTableWidgetItem(f"{v:.4f}"))
+        self.fl_corr_pairs_table.setUpdatesEnabled(False)
+        try:
+            self.fl_corr_pairs_table.setRowCount(0)
+            if corr_matrix is not None and not corr_matrix.empty:
+                pairs = []
+                for i in range(len(corr_matrix)):
+                    for j in range(i + 1, len(corr_matrix)):
+                        pairs.append((
+                            corr_matrix.index[i],
+                            corr_matrix.columns[j],
+                            abs(corr_matrix.iloc[i, j]),
+                        ))
+                pairs.sort(key=lambda x: x[2], reverse=True)
+                top_pairs = [p for p in pairs if p[2] > 0.7][:30]
+                self.fl_corr_pairs_table.setRowCount(len(top_pairs))
+                for idx, (a, b, v) in enumerate(top_pairs):
+                    self.fl_corr_pairs_table.setItem(idx, 0, QTableWidgetItem(str(a)))
+                    self.fl_corr_pairs_table.setItem(idx, 1, QTableWidgetItem(str(b)))
+                    self.fl_corr_pairs_table.setItem(idx, 2, QTableWidgetItem(f"{v:.4f}"))
+        finally:
+            self.fl_corr_pairs_table.setUpdatesEnabled(True)
 
     # ── Approval 标签 ──
 
