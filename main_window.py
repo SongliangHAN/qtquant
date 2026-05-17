@@ -987,8 +987,8 @@ class MainWindow(QMainWindow):
                     heatmap.setRowCount(0)
                     heatmap.setColumnCount(0)
                 else:
-                    n = len(corr_matrix)
-                    labels = list(corr_matrix.index)
+                    n = int(len(corr_matrix))
+                    labels = [str(x) for x in corr_matrix.index]
                     heatmap.setRowCount(n)
                     heatmap.setColumnCount(n)
                     heatmap.setHorizontalHeaderLabels(labels)
@@ -998,13 +998,11 @@ class MainWindow(QMainWindow):
                             v = float(vals[i, j])
                             item = QTableWidgetItem(f"{v:.2f}")
                             if not np.isnan(v):
-                                # coolwarm colormap: -1=blue, 0=white, 1=red
                                 r, g, b = self._corr_color(v)
-                                item.setBackground(QColor(r, g, b))
-                                # 白/黑色文字根据背景亮度
+                                item.setBackground(QColor(int(r), int(g), int(b)))
                                 if (r * 299 + g * 587 + b * 114) / 1000 < 128:
                                     item.setForeground(QColor(255, 255, 255))
-                            heatmap.setItem(i, j, item)
+                            heatmap.setItem(int(i), int(j), item)
                     heatmap.resizeColumnsToContents()
                     heatmap.resizeRowsToContents()
             else:
@@ -1042,20 +1040,21 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _corr_color(v: float):
         """coolwarm colormap: -1 → blue, 0 → white, 1 → red."""
+        v = float(v)
+        if np.isnan(v) or np.isinf(v):
+            return (255, 255, 255)
         t = max(-1.0, min(1.0, v))
         if t < 0:
-            # blue → white
-            s = 1.0 + t  # 0 to 1
+            s = float(1.0 + t)
             r = int(59 + (255 - 59) * s)
             g = int(76 + (255 - 76) * s)
             b = int(192 + (255 - 192) * s)
         else:
-            # white → red
-            s = t  # 0 to 1
+            s = float(t)
             r = int(255 - (255 - 180) * s)
             g = int(255 - (255 - 4) * s)
             b = int(255 - (255 - 38) * s)
-        return (r, g, b)
+        return (max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)))
 
     # ── Approval 标签 ──
 
