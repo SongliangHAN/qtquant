@@ -130,6 +130,7 @@ class FactorResearchEngine:
             "ic_decay": ic_decay,
             "corr_matrix": corr_matrix,
             "regime_ic": regime_ic,
+            "quantile_results": quantile_results,
             "turnover": turnover,
             "coverage": pd.Series({f: basic[f]["coverage_pct"] for f in factors}),
             "stability": stability,

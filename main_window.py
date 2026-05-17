@@ -622,7 +622,7 @@ class MainWindow(QMainWindow):
         l = QVBoxLayout(w)
         self.fl_summary_table = QTableView()
         self.fl_summary_table.setSortingEnabled(True)
-        self.fl_summary_table.setAlternatingRowColors(True)
+        self.fl_summary_table.setAlternatingRowColors(False)
         self.fl_summary_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.fl_summary_table.doubleClicked.connect(self._on_summary_double_click)
         l.addWidget(self.fl_summary_table)
@@ -797,6 +797,7 @@ class MainWindow(QMainWindow):
         clusters = results.get("clusters", {})
         stability = results.get("stability", pd.Series())
         monotonicity = results.get("monotonicity", pd.Series())
+        quantile_results = results.get("quantile_results", {})
 
         # 缓存
         from factor_cache import FactorCache
@@ -817,6 +818,7 @@ class MainWindow(QMainWindow):
                          [f for f in cache.cached_file_names()])
 
         self._fl_report = report
+        self._fl_q_cache = quantile_results
         self._fl_cached = {
             "rolling_ic": rolling_ic, "ic_decay": ic_decay,
             "corr_matrix": corr_matrix, "regime_ic": regime_ic,
@@ -1027,8 +1029,12 @@ class MainWindow(QMainWindow):
                 top_pairs = [p for p in pairs if p[2] > 0.7][:30]
                 self.fl_corr_pairs_table.setRowCount(len(top_pairs))
                 for idx, (a, b, v) in enumerate(top_pairs):
-                    self.fl_corr_pairs_table.setItem(idx, 0, QTableWidgetItem(str(a)))
-                    self.fl_corr_pairs_table.setItem(idx, 1, QTableWidgetItem(str(b)))
+                    name_a = (get_factor_info(a) or {}).get("name", a)
+                    name_b = (get_factor_info(b) or {}).get("name", b)
+                    item_a = QTableWidgetItem(f"{name_a} ({a})")
+                    item_b = QTableWidgetItem(f"{name_b} ({b})")
+                    self.fl_corr_pairs_table.setItem(idx, 0, item_a)
+                    self.fl_corr_pairs_table.setItem(idx, 1, item_b)
                     self.fl_corr_pairs_table.setItem(idx, 2, QTableWidgetItem(f"{v:.4f}"))
         finally:
             self.fl_corr_pairs_table.setUpdatesEnabled(True)
