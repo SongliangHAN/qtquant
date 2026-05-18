@@ -31,6 +31,15 @@ class FactorResearchEngine:
         self.lab = FactorLab(data)
         self._available = self._find_available_factors()
 
+    @staticmethod
+    def _safe_spearmanr(a, b):
+        """spearmanr that returns (nan, nan) when either input is constant."""
+        a = np.asarray(a)
+        b = np.asarray(b)
+        if np.ptp(a) == 0 or np.ptp(b) == 0:
+            return (np.nan, np.nan)
+        return spearmanr(a, b)
+
     def _find_available_factors(self) -> list[str]:
         """找出 data 中实际存在且注册的因子列。"""
         registered = get_all_factor_names()
@@ -205,7 +214,7 @@ class FactorResearchEngine:
                     ic_series[t] = np.nan
                     continue
                 try:
-                    ic, _ = spearmanr(sub_f.loc[common], sub_r.loc[common])
+                    ic, _ = self._safe_spearmanr(sub_f.loc[common], sub_r.loc[common])
                     ic_series[t] = abs(ic) if not np.isnan(ic) else np.nan
                 except Exception:
                     ic_series[t] = np.nan
@@ -267,7 +276,7 @@ class FactorResearchEngine:
                 if len(common) < 5:
                     continue
                 try:
-                    ic, _ = spearmanr(sub_f.loc[common], sub_r.loc[common])
+                    ic, _ = self._safe_spearmanr(sub_f.loc[common], sub_r.loc[common])
                     if not np.isnan(ic):
                         result[f][regime_val].append(abs(ic))
                 except Exception:
@@ -349,7 +358,7 @@ class FactorResearchEngine:
                 if len(common) < 5:
                     continue
                 try:
-                    ic, _ = spearmanr(sub_f.loc[common], sub_r.loc[common])
+                    ic, _ = self._safe_spearmanr(sub_f.loc[common], sub_r.loc[common])
                     if not np.isnan(ic):
                         ics.append(abs(ic))
                 except Exception:
@@ -448,7 +457,7 @@ class FactorResearchEngine:
                 vals[f] = np.nan
                 continue
             try:
-                r, _ = spearmanr(q_ranks, mean_per_q.values)
+                r, _ = self._safe_spearmanr(q_ranks, mean_per_q.values)
                 vals[f] = float(r)
             except Exception:
                 vals[f] = np.nan
